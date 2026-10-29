@@ -1,0 +1,5 @@
+# nix 提供的 cc wrapper 的库搜索路径里没有 macOS SDK,
+# Rust std 链接期需要的 -liconv 会找不到。改用系统 clang:
+# 它自带 SDK 路径,libiconv.tbd 与 CoreGraphics framework 都在其中。
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
