@@ -7,7 +7,7 @@ use std::io;
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hidpipe_proto as proto;
 use proto::Frame;
@@ -56,12 +56,19 @@ impl Connection {
 // 读线程最迟在一个读超时(6s)后退出。
 
 fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg>, id: u64) {
+    // Ping 必须按时刻表发出,与数据流量正交:
+    // 若用“channel 空闲 2s 才 Ping”,持续鼠标移动会让 Ping 永远排不上队,
+    // 对端收不到 Ping 就不回 Pong,读线程 6s 超时误判连接死亡。
+    let mut next_ping = Instant::now() + PING_INTERVAL;
     loop {
-        let frame = match rx.recv_timeout(PING_INTERVAL) {
+        let frame = match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
             Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => Frame::Ping,
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        if matches!(frame, Frame::Ping) {
+            next_ping = Instant::now() + PING_INTERVAL;
+        }
         if proto::write_frame(&mut stream, &frame).is_err() {
             let _ = net_tx.send(NetMsg::Dead(id));
             return;
