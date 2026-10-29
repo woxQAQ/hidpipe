@@ -149,6 +149,9 @@ impl Injector {
             0x37, 0x36, // Command 左/右
         ];
         for code in MODIFIERS {
+            // 成对投递:系统对无匹配的孤立 up 可能直接忽略;
+            // down+up 无论之前处于什么状态,都以释放收场。
+            post_key(&self.source, code, true, false);
             post_key(&self.source, code, false, false);
         }
     }
