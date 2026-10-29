@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 evdev = "0.12"
+# 边缘屏障:layer-shell 客户端。
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # 日志时间戳用,纯格式化。
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 # 仅用于把设备 fd 设为非阻塞(fcntl O_NONBLOCK),evdev 0.12 未暴露此能力。

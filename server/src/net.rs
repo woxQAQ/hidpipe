@@ -18,6 +18,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(6);
 pub enum NetMsg {
     /// 候选连接的首帧是版本匹配的 Hello,可上岗。
     Hello(u64),
+    /// client 请求交还控制(光标顶到 Mac 左缘)。
+    ReturnToLocal(u64),
     /// 连接已死(读超时/写失败/对端关闭/握手非法),携带连接代数。
     Dead(u64),
 }
@@ -84,6 +86,9 @@ fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>,
         match proto::read_frame(&mut stream) {
             Ok(Frame::Ping) => {
                 let _ = tx.send(Frame::Pong);
+            }
+            Ok(Frame::ReturnToLocal) => {
+                let _ = net_tx.send(NetMsg::ReturnToLocal(id));
             }
             // Hello / Pong 等其余帧不影响主循环,忽略。
             Ok(_) => {}

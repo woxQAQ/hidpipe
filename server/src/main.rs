@@ -8,7 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+#[macro_use]
+mod log;
 mod args;
+mod barrier;
 mod hid;
 mod net;
 
@@ -24,22 +27,8 @@ use evdev::{Device, InputEventKind, Key, RelativeAxisType};
 use hidpipe_proto::{ButtonState, Frame, KeyState, MouseButton};
 
 use args::Args;
+use barrier::BarrierEvent;
 use net::{Connection, NetMsg};
-
-/// 运行日志统一带本地时间戳,格式 [HH:MM:SS]。
-macro_rules! log {
-    ($($arg:tt)*) => {
-        eprintln!("[{}] {}", timestamp(), format_args!($($arg)*))
-    };
-}
-
-fn timestamp() -> String {
-    let fmt = time::macros::format_description!("[hour]:[minute]:[second]");
-    time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
-        .format(&fmt)
-        .unwrap_or_default()
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -84,6 +73,10 @@ fn main() -> io::Result<()> {
     listener.set_nonblocking(true)?;
 
     let (net_tx, net_rx) = mpsc::channel::<NetMsg>();
+    let (barrier_tx, barrier_rx) = mpsc::channel::<BarrierEvent>();
+    if !args.no_barrier {
+        barrier::spawn(barrier_tx);
+    }
     let mut app = App {
         kbd,
         mouse,
@@ -93,16 +86,20 @@ fn main() -> io::Result<()> {
         mode: Mode::Local,
         motion: (0, 0),
         wheel: (0, 0),
+        armed: true,
         switch_key: args.switch_key,
+        probe: args.probe,
         swap_caps_esc: args.swap_caps_esc,
         listener,
         net_tx,
         net_rx,
+        barrier_rx,
     };
 
     loop {
         app.accept_pending();
         app.handle_net_msgs();
+        app.drain_barrier();
         app.drain_keyboard();
         app.drain_mouse();
         sleep(Duration::from_millis(1));
@@ -123,10 +120,15 @@ struct App {
     motion: (i64, i64),
     wheel: (i64, i64),
     switch_key: Key,
+    probe: bool,
     swap_caps_esc: bool,
     listener: TcpListener,
     net_tx: mpsc::Sender<NetMsg>,
     net_rx: mpsc::Receiver<NetMsg>,
+    barrier_rx: mpsc::Receiver<BarrierEvent>,
+    /// 屏障武装状态:进入远程模式后解除,指针离开屏障后重新武装。
+    /// 防止从远程切回本地时指针还停在屏障上,立刻又弹回远程。
+    armed: bool,
 }
 
 impl App {
@@ -165,6 +167,32 @@ impl App {
                         self.leave_remote();
                     }
                 }
+                NetMsg::ReturnToLocal(id) => {
+                    if self.conn.as_ref().is_some_and(|c| c.id == id) && self.mode == Mode::Remote {
+                        log!("对端边缘触发,交还控制");
+                        self.send(Frame::ReleaseAll);
+                        self.leave_remote();
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_barrier(&mut self) {
+        // 先收齐事件再处理,避免 try_recv 的不可变借用卡住 &mut self。
+        let mut events = Vec::new();
+        while let Ok(event) = self.barrier_rx.try_recv() {
+            events.push(event);
+        }
+        for event in events {
+            match event {
+                BarrierEvent::Enter => {
+                    if self.armed && self.mode == Mode::Local {
+                        self.armed = false;
+                        self.toggle_mode();
+                    }
+                }
+                BarrierEvent::Leave => self.armed = true,
             }
         }
     }
@@ -209,6 +237,13 @@ impl App {
 
     /// value: 0 = 松开,1 = 按下,2 = 长按重复。
     fn on_key(&mut self, key: Key, value: i32) {
+        if self.probe {
+            // 探键模式只报名字,不做任何切换/转发。
+            if value == 1 {
+                log!("按下: {key:?}");
+            }
+            return;
+        }
         if key == self.switch_key {
             if value == 1 {
                 self.toggle_mode();

@@ -31,6 +31,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// 每格滚轮折算的行数,对齐 macOS 原生鼠标的手感。
 const LINES_PER_NOTCH: i32 = 3;
+/// 返程触发阈值:光标钳制在左缘后,持续左推累计超过该位移(px)
+/// 才交还控制。阈值保证只有故意的“推穿边缘”会触发,
+/// 日常贴着左缘的正常操作不会。
+const RETURN_PUSH_THRESHOLD: i32 = 600;
 
 /// 运行日志统一带本地时间戳,格式 [HH:MM:SS]。
 macro_rules! log {
@@ -75,7 +79,11 @@ fn session(args: &Args) -> io::Result<()> {
         let frame = proto::read_frame(&mut stream)?;
         match frame {
             Frame::Ping => proto::write_frame(&mut stream, &Frame::Pong)?,
-            frame => injector.handle(frame),
+            frame => {
+                if let Some(back) = injector.handle(frame) {
+                    proto::write_frame(&mut stream, &back)?;
+                }
+            }
         }
     }
 }
@@ -85,6 +93,8 @@ struct Injector {
     pressed_keys: HashSet<u16>,
     pressed_buttons: HashSet<MouseButton>,
     flip_scroll: bool,
+    /// 光标钳制在左缘期间累计的继续左推位移,用于返程触发。
+    edge_push: i32,
 }
 
 impl Injector {
@@ -96,18 +106,21 @@ impl Injector {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             flip_scroll,
+            edge_push: 0,
         }
     }
 
-    fn handle(&mut self, frame: Frame) {
+    /// 处理一帧;若需要回话(如返程触发),返回要发回的帧。
+    fn handle(&mut self, frame: Frame) -> Option<Frame> {
         match frame {
             Frame::Key { usage, state } => self.key(usage, state),
-            Frame::Motion { dx, dy } => self.motion(dx, dy),
+            Frame::Motion { dx, dy } => return self.motion(dx, dy),
             Frame::Button { button, state } => self.button(button, state),
             Frame::Wheel { dx, dy } => self.wheel(dx, dy),
             Frame::ReleaseAll => self.release_all(),
             _ => {}
         }
+        None
     }
 
     fn key(&mut self, usage: u16, state: KeyState) {
@@ -138,8 +151,10 @@ impl Injector {
         event.post(CGEventTapLocation::HID);
     }
 
-    fn motion(&mut self, dx: i16, dy: i16) {
-        let Some(mut p) = self.location() else { return };
+    fn motion(&mut self, dx: i16, dy: i16) -> Option<Frame> {
+        let Some(mut p) = self.location() else {
+            return None;
+        };
         // v0 只钳制在主屏;多屏支持在 roadmap。
         let b = CGDisplay::main().bounds();
         p.x = (p.x + f64::from(dx)).clamp(b.origin.x, b.origin.x + b.size.width - 1.0);
@@ -157,12 +172,26 @@ impl Injector {
         let Ok(event) =
             CGEvent::new_mouse_event(self.source.clone(), event_type, p, CGMouseButton::Left)
         else {
-            return;
+            return None;
         };
         // 游戏等读相对位移的场景看 delta 字段,而非绝对位置。
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
         event.post(CGEventTapLocation::HID);
+
+        // 返程边缘检测:光标已钳制在左缘、未按任何按钮、仍在左推,
+        // 三者同时成立才累计——拖动窗口/拖选贴着左缘不会误触。
+        if p.x <= b.origin.x && dx < 0 && self.pressed_buttons.is_empty() {
+            self.edge_push += i32::from(-dx);
+            if self.edge_push > RETURN_PUSH_THRESHOLD {
+                self.edge_push = 0;
+                log!("光标推穿左缘,交还控制");
+                return Some(Frame::ReturnToLocal);
+            }
+        } else {
+            self.edge_push = 0;
+        }
+        None
     }
 
     fn button(&mut self, button: MouseButton, state: ButtonState) {

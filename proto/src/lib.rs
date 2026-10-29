@@ -45,6 +45,10 @@ pub enum Frame {
     ReleaseAll,
     Ping,
     Pong,
+    /// client → server:光标顶到 Mac 朝向 Linux 的边缘并持续推挤,
+    /// 请求交还控制。与 ReleaseAll 对称:一个是 server 主动收回,
+    /// 一个是 client 侧用户意图的确定性表达。
+    ReturnToLocal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +84,7 @@ const TAG_WHEEL: u8 = 0x04;
 const TAG_RELEASE_ALL: u8 = 0x05;
 const TAG_PING: u8 = 0x06;
 const TAG_PONG: u8 = 0x07;
+const TAG_RETURN_TO_LOCAL: u8 = 0x08;
 
 /// 各 tag 对应的定长 payload 长度;未知 tag 返回 None。
 pub const fn payload_len(tag: u8) -> Option<usize> {
@@ -88,7 +93,7 @@ pub const fn payload_len(tag: u8) -> Option<usize> {
         TAG_KEY => Some(3),
         TAG_MOTION => Some(4),
         TAG_BUTTON | TAG_WHEEL => Some(2),
-        TAG_RELEASE_ALL | TAG_PING | TAG_PONG => Some(0),
+        TAG_RELEASE_ALL | TAG_PING | TAG_PONG | TAG_RETURN_TO_LOCAL => Some(0),
         _ => None,
     }
 }
@@ -112,6 +117,7 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         Frame::ReleaseAll => out.push(TAG_RELEASE_ALL),
         Frame::Ping => out.push(TAG_PING),
         Frame::Pong => out.push(TAG_PONG),
+        Frame::ReturnToLocal => out.push(TAG_RETURN_TO_LOCAL),
     }
     out
 }
@@ -154,6 +160,7 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<Frame> {
         TAG_RELEASE_ALL => Frame::ReleaseAll,
         TAG_PING => Frame::Ping,
         TAG_PONG => Frame::Pong,
+        TAG_RETURN_TO_LOCAL => Frame::ReturnToLocal,
         _ => return None,
     })
 }

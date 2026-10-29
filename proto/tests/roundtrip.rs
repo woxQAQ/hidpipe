@@ -43,6 +43,7 @@ fn cases() -> Vec<Frame> {
         Frame::ReleaseAll,
         Frame::Ping,
         Frame::Pong,
+        Frame::ReturnToLocal,
     ]
 }
 

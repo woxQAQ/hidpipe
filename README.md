@@ -60,7 +60,7 @@ hidpipe-client <linux-ip>         # 断线每秒重试,直到成功
 
 首次运行需在 **系统设置 → 隐私与安全性 → 辅助功能** 授权运行它的终端(iTerm/Terminal 等)。
 
-**使用**:按 `ScrollLock` 在 本地 ↔ 远程 之间切换。远程模式下 Linux 侧光标冻结(设备被独占),所有输入发往 Mac;再按一次回来。切换键可用 `--switch-key pause` 等更换。
+**使用**：把光标推到 Linux 屏幕**右缘**即切入远程(Layer-shell 屏障,compositor 背书的精确检测);在 Mac 上把光标**顶住左缘继续左推**即交还控制。`ScrollLock` 等热键(`--switch-key`)作为备用始终有效。远程模式下 Linux 侧光标冻结(设备被独占),所有输入发往 Mac。
 
 ## 参数
 
@@ -68,7 +68,9 @@ hidpipe-client <linux-ip>         # 断线每秒重试,直到成功
 |---|---|---|
 | `--bind` / `--port` | 0.0.0.0 / 24800 | 监听地址与端口 |
 | `--keyboard` / `--mouse` | 自动探测 | 设备名子串过滤 |
-| `--switch-key` | scrolllock | 切换键:scrolllock / pause / f13..f24 |
+| `--switch-key` | scrolllock | 备用切换键,可选名见 `--help` |
+| `--no-barrier` | 关 | 禁用屏幕右缘屏障,只用热键 |
+| `--probe` | 关 | 探键模式:按什么打印什么,用于选切换键 |
 | `--swap-caps-esc` | 关 | 捕获侧补做 caps↔esc(仅当互换不在 keyd 层时) |
 
 | client | 默认 | 说明 |
@@ -82,6 +84,8 @@ hidpipe-client <linux-ip>         # 断线每秒重试,直到成功
 - 媒体键(音量/播放)未映射——它们在 HID consumer page,不在 keyboard page。
 - macOS 的 **SecureEventInput**:密码框聚焦时系统丢弃一切合成事件。这是平台策略,任何注入式方案(deskflow 同)都绕不过。
 - 鼠标钳制在主屏;多屏支持在 roadmap。
+- 边缘屏障建在**每个输出的右缘**;多显示器且右侧还有显示器时,内接缝也会触发(指定输出的开关在 roadmap)。
+- 返程方向(Mac → Linux)只检测 Mac **主屏左缘**。
 - 键鼠热插拔未处理(读取失败会回本地模式并打日志,重启 server 恢复)。
 - 鼠标侧键(前进/后退)未转发。
 
@@ -90,8 +94,9 @@ hidpipe-client <linux-ip>         # 断线每秒重试,直到成功
 - [ ] TLS(自签证书对,fingerprint 认证)
 - [ ] WoL / mDNS 心跳——server 主动唤醒 client 方向
 - [ ] nix 模块:systemd service(Linux)+ launchd agent(macOS)
-- [ ] 多屏坐标钳制
+- [ ] 多屏:屏障按输出名配置;Mac 侧多屏钳制
+- [ ] 切入远程时按 Y 比例映射 Mac 光标初始位置
 - [ ] 媒体键(consumer page)
 - [ ] 剪贴板同步(谨慎,Worst case 先不做)
 
-**明确不做**:光标边缘检测切换。没有 compositor 协作的边缘检测靠相对位移累加,必然漂移;热键切换是确定性的,与本项目价值观一致。
+**为什么又是边缘切换了**：最初否决的是“位移累加估算光标位置”的伪边缘检测(必漂移)。现在的实现是两条确定性路径：正向靠 layer-shell 屏障(compositor 亲自发 enter 事件),返程靠 client 端精确的光标钳制状态。没有任何估算成分。热键作为备用通道保留。
