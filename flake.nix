@@ -1,5 +1,5 @@
 {
-  description = "hidpipe — 跨机 HID 事件管道 (Linux 捕获 → macOS 注入)";
+  description = "hidpipe: cross-machine HID event pipe (capture on Linux, inject on macOS)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -26,8 +26,9 @@
               clippy
               rust-analyzer
             ];
-            # darwin 上 Rust 链接期需要 -liconv;放进 buildInputs
-            # 让 stdenv 的 NIX_LDFLAGS 带上它的库路径。
+            # Rust on darwin needs -liconv at link time; putting it in
+            # buildInputs makes stdenv's NIX_LDFLAGS pick up its library
+            # path.
             buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
           };
         }

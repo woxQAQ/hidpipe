@@ -1,7 +1,9 @@
-//! 单客户端 TCP 连接的读写线程。
+//! Read/write threads for a single client TCP connection.
 //!
-//! 保活策略:写线程每 2s 发 Ping;读线程 6s 读不到任何帧即判死,
-//! 上报 `NetMsg::Dead(连接代数)`。主循环凭代数忽略旧连接迟到的死讯。
+//! Keepalive: the writer sends a Ping every 2s; the reader declares the
+//! connection dead after 6s without any frame and reports
+//! `NetMsg::Dead(connection generation)`. The main loop uses the generation
+//! to ignore late death notices from superseded connections.
 
 use std::io;
 use std::net::TcpStream;
@@ -16,11 +18,14 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub enum NetMsg {
-    /// 候选连接的首帧是版本匹配的 Hello,可上岗。
+    /// The pending connection's first frame was a version-matching Hello;
+    /// it may take over.
     Hello(u64),
-    /// client 请求交还控制(光标顶到 Mac 左缘)。
+    /// The client asks to hand control back (cursor pushed against the
+    /// Mac's left edge).
     ReturnToLocal(u64),
-    /// 连接已死(读超时/写失败/对端关闭/握手非法),携带连接代数。
+    /// The connection is dead (read timeout, write failure, peer closed,
+    /// bad handshake). Carries the connection generation.
     Dead(u64),
 }
 
@@ -46,19 +51,22 @@ impl Connection {
         Ok(Self { id, tx })
     }
 
-    /// 发送失败说明对端已死,读/写线程会随后上报 Dead,这里静默丢弃。
+    /// A failed send means the peer is dead; the read/write threads report
+    /// Dead shortly after, so the frame is dropped silently here.
     pub fn send(&self, frame: Frame) {
         let _ = self.tx.send(frame);
     }
 }
 
-// 主循环丢弃 Connection 即关闭 channel,写线程随之退出;
-// 读线程最迟在一个读超时(6s)后退出。
+// When the main loop drops the Connection the channel closes and the
+// writer exits; the reader exits at the latest after one read timeout (6s).
 
 fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg>, id: u64) {
-    // Ping 必须按时刻表发出,与数据流量正交:
-    // 若用“channel 空闲 2s 才 Ping”,持续鼠标移动会让 Ping 永远排不上队,
-    // 对端收不到 Ping 就不回 Pong,读线程 6s 超时误判连接死亡。
+    // Pings must go out on schedule, independent of data traffic. If we
+    // only pinged after 2s of channel idle, constant mouse motion would
+    // starve Ping forever: the peer would never see a Ping, never answer
+    // Pong, and our reader would wrongly declare the connection dead after
+    // 6s.
     let mut next_ping = Instant::now() + PING_INTERVAL;
     loop {
         let frame = match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
@@ -77,9 +85,12 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg
 }
 
 fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>, id: u64) {
-    // 首帧必须是版本匹配的 Hello,否则立即判死。
-    // 未通过握手的连接无权顶掉已上岗的连接——这是协议级准入控制,
-    // 防止同端口的旧协议客户端(如 deskflow 的重试循环)挤掉正常连接。
+    // The first frame must be a version-matching Hello, otherwise the
+    // connection is declared dead at once. A connection that fails the
+    // handshake must not displace the serving one. This is admission
+    // control at the protocol level: it keeps other clients on the same
+    // port (such as deskflow's retry loop) from knocking out a healthy
+    // connection.
     match proto::read_frame(&mut stream) {
         Ok(Frame::Hello { version }) if version == proto::VERSION => {
             let _ = net_tx.send(NetMsg::Hello(id));
@@ -97,7 +108,8 @@ fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>,
             Ok(Frame::ReturnToLocal) => {
                 let _ = net_tx.send(NetMsg::ReturnToLocal(id));
             }
-            // Hello / Pong 等其余帧不影响主循环,忽略。
+            // Hello, Pong and other frames do not concern the main loop;
+            // ignore them.
             Ok(_) => {}
             Err(_) => {
                 let _ = net_tx.send(NetMsg::Dead(id));

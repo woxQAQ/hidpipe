@@ -1,32 +1,35 @@
-//! hidpipe 线上协议 v0。
+//! hidpipe wire protocol v0.
 //!
-//! 协议只承载原始 HID 事件:键盘为 USB HID keyboard page (0x07) 的
-//! usage ID,鼠标为相对位移与按键编号。协议不理解 keymap / keysym,
-//! 也不做 keymap 协商——翻译只发生在两端本地的静态查表。
-//! 这是整个系统确定性的来源:线上没有任何会漂移的状态机。
+//! The protocol carries raw HID events only: keyboards as USB HID keyboard
+//! page (0x07) usage IDs, mice as relative motion and button numbers. It
+//! does not understand keymaps or keysyms and does no keymap negotiation;
+//! translation happens in static tables local to each end. This is where
+//! the system's determinism comes from: there is no state machine on the
+//! wire that could drift.
 //!
-//! 帧格式:`[tag: u8][payload]`,多字节字段大端。v0 为明文 TCP,
-//! 仅用于可信 LAN。
+//! Frame format: `[tag: u8][payload]`, multi-byte fields big-endian. v0 is
+//! plain TCP for trusted LANs only.
 
 #![forbid(unsafe_code)]
 
 use std::io::{self, Read, Write};
 
-/// 协议版本。握手帧携带,不一致即拒绝,避免沉默的语义错位。
+/// Protocol version, carried in the handshake. A mismatch is rejected
+/// instead of silently misinterpreting frames.
 pub const VERSION: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame {
-    /// 客户端连上后发送的第一帧。
+    /// First frame a client sends after connecting.
     Hello {
         version: u8,
     },
-    /// 键盘事件。usage 为 USB HID page 0x07 usage ID。
+    /// Keyboard event. usage is a USB HID page 0x07 usage ID.
     Key {
         usage: u16,
         state: KeyState,
     },
-    /// 一个上报周期内累加的相对位移。
+    /// Relative motion accumulated over one report cycle.
     Motion {
         dx: i16,
         dy: i16,
@@ -35,19 +38,22 @@ pub enum Frame {
         button: MouseButton,
         state: ButtonState,
     },
-    /// 滚轮。dy > 0 表示滚轮向远离用户方向滚动(内容上滚)。
+    /// Wheel. dy > 0 means the wheel moves away from the user (content
+    /// scrolls up).
     Wheel {
         dx: i8,
         dy: i8,
     },
-    /// 要求对端释放所有按住的键与按钮。
-    /// 切回本地或断线前发送,防止对端残留卡住的修饰键。
+    /// Ask the peer to release all held keys and buttons. Sent before
+    /// switching back to local or disconnecting, so no modifiers get stuck
+    /// on the peer.
     ReleaseAll,
     Ping,
     Pong,
-    /// client → server:光标顶到 Mac 朝向 Linux 的边缘并持续推挤,
-    /// 请求交还控制。与 ReleaseAll 对称:一个是 server 主动收回,
-    /// 一个是 client 侧用户意图的确定性表达。
+    /// client to server: the cursor is pinned at the Mac edge facing Linux
+    /// and keeps pushing; a request to hand control back. Symmetric to
+    /// ReleaseAll: one is the server taking control back, the other is the
+    /// user on the client side expressing intent deterministically.
     ReturnToLocal,
 }
 
@@ -56,8 +62,8 @@ pub enum Frame {
 pub enum KeyState {
     Release = 0,
     Press = 1,
-    /// 长按产生的自动重复。对端据此打 autorepeat 标记,
-    /// 与真实按键重复行为对齐。
+    /// Auto-repeat from holding a key. The peer uses it to set the
+    /// autorepeat flag, matching real key repeat behavior.
     Repeat = 2,
 }
 
@@ -86,7 +92,7 @@ const TAG_PING: u8 = 0x06;
 const TAG_PONG: u8 = 0x07;
 const TAG_RETURN_TO_LOCAL: u8 = 0x08;
 
-/// 各 tag 对应的定长 payload 长度;未知 tag 返回 None。
+/// Fixed payload length per tag; None for unknown tags.
 pub const fn payload_len(tag: u8) -> Option<usize> {
     match tag {
         TAG_HELLO => Some(1),
@@ -169,7 +175,8 @@ fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// 从流中读一帧。读超时或连接中断以 Err 上抛,由调用方判死。
+/// Read one frame from the stream. Read timeouts and connection errors
+/// surface as Err for the caller to judge.
 pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag)?;

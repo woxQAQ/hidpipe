@@ -1,102 +1,103 @@
 # hidpipe
 
-跨机 HID 事件管道:Linux 捕获 → macOS 注入。名字即架构——**HID usage ID 在管道里流动**,仅此而已。
+Cross-machine HID event pipe: capture on Linux, inject on macOS. The wire carries HID usage IDs and nothing else.
 
-为解决 deskflow/synergy 系的三个结构性痛点而生:
+It fixes three structural problems of the deskflow/synergy family:
 
-1. **换键薛定谔**:keysym 翻译 + 跨机 keymap 协商是两个会漂移的状态机;
-2. **延迟**:翻译层与事件循环排队;
-3. **异常补救弱**:无心跳自愈、无防卡键安全阀。
+1. Fragile key remapping. Keysym translation plus cross-machine keymap negotiation are two state machines that drift apart.
+2. Latency. The translation layer and event loop queuing add delay.
+3. Weak failure recovery. No heartbeat-based self-healing, no safety valve against stuck keys.
 
-## 架构
+## Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Linux["Linux (server: 键盘鼠标所在机)"]
-        K[物理键鼠] --> KD[keyd: 改键唯一发生地]
-        KD -->|evdev 原始事件| S[hidpipe-server<br/>EVIOCGRAB + 热键切换]
+    subgraph Linux["Linux (server: machine with the keyboard and mouse)"]
+        K[physical keyboard and mouse] --> KD[keyd: the only place remapping happens]
+        KD -->|raw evdev events| S[hidpipe-server<br/>EVIOCGRAB + hotkey switching]
     end
-    subgraph Wire["线上协议: 无语义"]
-        S -->|"HID usage ID 帧<br/>TCP_NODELAY 明文"| C
+    subgraph Wire["wire protocol: no semantics"]
+        S -->|"HID usage ID frames<br/>plain TCP, TCP_NODELAY"| C
     end
     subgraph macOS["macOS (client)"]
-        C[hidpipe-client<br/>CGEventPost @ HID tap] --> SYS[系统]
-        KB[Karabiner] -.->|驱动层, 看不到注入事件| SYS
+        C[hidpipe-client<br/>CGEventPost @ HID tap] --> SYS[system]
+        KB[Karabiner] -.->|driver level, cannot see injected events| SYS
     end
 ```
 
-三条设计不变量:
+Three design invariants:
 
-1. **协议无语义**:线上只有原始 HID 事件。没有 keymap 协商,没有修饰键状态机,没有缓存——没有能漂移的东西。
-2. **换键恰好一次,位置固定**:改键全部发生在捕获侧的 keyd(支持 `overload(control, esc)` 这类状态性改键,解析完才上线)。macOS 注入在 Quartz 层,结构性绕过 Karabiner,不会双重映射,也不依赖对端任何配置。
-3. **断线即释放**:连接死亡 ⇒ server 立即 ungrab;client Drop 时释放所有按住的键。grab/按键状态随连接生灭,不留残渣。
+1. The protocol has no semantics. Only raw HID events go on the wire. No keymap negotiation, no modifier state machine, no cache. Nothing that can drift.
+2. Remapping happens exactly once, at a fixed place. All remapping is done by keyd on the capture side, which resolves stateful remaps like `overload(control, esc)` before events go on the wire. Injection on macOS happens at the Quartz layer, below Karabiner's driver, so injected events are never remapped twice and the Mac side needs no configuration.
+3. Disconnect releases everything. When the connection dies, the server ungrabs at once and the client releases all held keys on Drop. Grab and key state live and die with the connection.
 
-## 构建
+## Build
 
 ```bash
-# Linux(捕获端)
+# Linux (capture side)
 cargo build --release -p hidpipe-server
 
-# macOS(注入端,在 Mac 上构建)
+# macOS (injection side, build on the Mac)
 cargo build --release -p hidpipe-client
 ```
 
-也可以用 `nix develop` 拿到 Rust 工具链。
+`nix develop` provides a Rust toolchain.
 
-## 运行
+## Run
 
-**Linux**(需要读 `/dev/input/event*` 的权限,`input` 组即可):
+Linux needs read access to `/dev/input/event*`; membership in the `input` group is enough.
 
 ```bash
-hidpipe-server                    # 自动探测设备,keyd 虚拟设备优先
+hidpipe-server                    # auto-detect devices, prefer the keyd virtual keyboard
 hidpipe-server --keyboard "keyd" --mouse "MX Master" --port 24800
 ```
 
-**macOS**:
+macOS:
 
 ```bash
-hidpipe-client <linux-ip>         # 断线每秒重试,直到成功
+hidpipe-client <linux-ip>         # retries once a second until connected
 ```
 
-首次运行需在 **系统设置 → 隐私与安全性 → 辅助功能** 授权运行它的终端(iTerm/Terminal 等)。
+On first run, grant the terminal (iTerm, Terminal, etc.) access in System Settings > Privacy & Security > Accessibility.
 
-**使用**：把光标推到 Linux 屏幕**右缘**即切入远程(Layer-shell 屏障,compositor 背书的精确检测);在 Mac 上把光标**顶住左缘继续左推**即交还控制。`ScrollLock` 等热键(`--switch-key`)作为备用始终有效。远程模式下 Linux 侧光标冻结(设备被独占),所有输入发往 Mac。
+Switching works like this. Push the cursor past the right edge of the Linux screen to enter remote mode; the trigger is a layer-shell barrier, so the compositor itself detects the crossing. On the Mac, push the cursor against the left edge and keep pushing to hand control back. A hotkey (`ScrollLock` by default, see `--switch-key`) always works as a fallback. In remote mode the Linux cursor freezes because the devices are grabbed, and all input goes to the Mac.
 
-## 参数
+## Options
 
-| server | 默认 | 说明 |
+| server | default | description |
 |---|---|---|
-| `--bind` / `--port` | 0.0.0.0 / 24800 | 监听地址与端口 |
-| `--keyboard` / `--mouse` | 自动探测 | 设备名子串过滤 |
-| `--switch-key` | scrolllock | 备用切换键,可选名见 `--help` |
-| `--no-barrier` | 关 | 禁用屏幕右缘屏障,只用热键 |
-| `--probe` | 关 | 探键模式:按什么打印什么,用于选切换键 |
-| `--swap-caps-esc` | 关 | 捕获侧补做 caps↔esc(仅当互换不在 keyd 层时) |
+| `--bind` / `--port` | 0.0.0.0 / 24800 | listen address and port |
+| `--keyboard` / `--mouse` | auto-detect | device name substring filter |
+| `--switch-key` | scrolllock | fallback switch key; names in `--help` |
+| `--no-barrier` | off | disable the right-edge barrier, hotkey only |
+| `--probe` | off | key probe mode, prints what you press, for picking a switch key |
+| `--swap-caps-esc` | off | redo the caps/esc swap on the capture side (only when keyd does not do it) |
 
-| client | 默认 | 说明 |
+| client | default | description |
 |---|---|---|
-| `--port` | 24800 | 服务器端口 |
-| `--flip-scroll` | 关 | 反转滚轮方向 |
+| `--port` | 24800 | server port |
+| `--flip-scroll` | off | reverse scroll direction |
 
-## 已知限制(v0,周末原型)
+## Known limitations (v0, weekend prototype)
 
-- **明文 TCP**,仅可信 LAN;TLS 在 roadmap。
-- 媒体键(音量/播放)未映射——它们在 HID consumer page,不在 keyboard page。
-- macOS 的 **SecureEventInput**:密码框聚焦时系统丢弃一切合成事件。这是平台策略,任何注入式方案(deskflow 同)都绕不过。
-- 鼠标钳制在主屏;多屏支持在 roadmap。
-- 边缘屏障建在**每个输出的右缘**;多显示器且右侧还有显示器时,内接缝也会触发(指定输出的开关在 roadmap)。
-- 返程方向(Mac → Linux)只检测 Mac **主屏左缘**。
-- 键鼠热插拔未处理(读取失败会回本地模式并打日志,重启 server 恢复)。
-- 鼠标侧键(前进/后退)未转发。
+- Plain TCP, trusted LANs only. TLS is on the roadmap.
+- Media keys (volume, playback) are not mapped. They live on the HID consumer page, not the keyboard page.
+- macOS SecureEventInput: when a password field has focus, the system discards all synthetic events. This is platform policy; no injection-based tool, deskflow included, can bypass it.
+- The mouse is clamped to the main display. Multi-monitor support is on the roadmap.
+- The barrier sits on the right edge of every output. With multiple monitors, the seam between two outputs triggers it too. Per-output configuration is on the roadmap.
+- The return direction (Mac to Linux) only watches the left edge of the Mac's main display.
+- Hot-plug is not handled. A failed read falls back to local mode and logs; restart the server to recover.
+- Side mouse buttons (back, forward) are not forwarded.
 
 ## Roadmap
 
-- [ ] TLS(自签证书对,fingerprint 认证)
-- [ ] WoL / mDNS 心跳——server 主动唤醒 client 方向
-- [ ] nix 模块:systemd service(Linux)+ launchd agent(macOS)
-- [ ] 多屏:屏障按输出名配置;Mac 侧多屏钳制
-- [ ] 切入远程时按 Y 比例映射 Mac 光标初始位置
-- [ ] 媒体键(consumer page)
-- [ ] 剪贴板同步(谨慎,Worst case 先不做)
+- [ ] TLS (self-signed certificate pair, fingerprint authentication)
+- [ ] nix modules: systemd service on Linux, launchd agent on macOS
+- [ ] multi-monitor: barrier configurable per output, cursor clamping across Mac displays
+- [ ] map the Mac cursor's initial Y by screen ratio when entering remote mode
+- [ ] media keys (consumer page)
+- [ ] clipboard sync (needs careful design, may stay out)
 
-**为什么又是边缘切换了**：最初否决的是“位移累加估算光标位置”的伪边缘检测(必漂移)。现在的实现是两条确定性路径：正向靠 layer-shell 屏障(compositor 亲自发 enter 事件),返程靠 client 端精确的光标钳制状态。没有任何估算成分。热键作为备用通道保留。
+## Why edge switching came back
+
+The first draft rejected pseudo edge detection that accumulates deltas to estimate the cursor position, because it always drifts. The current implementation uses two deterministic paths instead: a layer-shell barrier on the way in (the compositor itself sends the enter event), and precise cursor clamping on the client for the way back. There is no estimation anywhere. The hotkey remains as a fallback.

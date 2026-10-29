@@ -1,44 +1,48 @@
-//! 命令行参数。零依赖手撸——参数面就这几个,不值得上 clap。
+//! Command line arguments. Hand-rolled with zero dependencies; the flag
+//! surface is too small to justify clap.
 
 use evdev::Key;
 
 pub struct Args {
     pub bind: String,
     pub port: u16,
-    /// 设备名子串过滤器,None 表示自动探测。
+    /// Device name substring filter; None means auto-detect.
     pub keyboard: Option<String>,
     pub mouse: Option<String>,
     pub switch_key: Key,
-    /// 探键模式:打印每个按下的键名,不执行切换/转发。
-    /// 用于给 --switch-key 选一个物理上存在且不常用的键。
+    /// Key probe mode: print the name of every pressed key without
+    /// switching or forwarding. Used to pick a --switch-key that physically
+    /// exists and is rarely used.
     pub probe: bool,
-    /// 禁用 Wayland 边缘屏障(非 Wayland 会话或只要热键时用)。
+    /// Disable the Wayland edge barrier (for non-Wayland sessions or
+    /// hotkey-only use).
     pub no_barrier: bool,
-    /// 在捕获侧做 caps ↔ esc 互换,只影响发往远端的按键。
-    /// 当本地会话的互换做在 xkb 层(evdev 之上)时,远端拿不到互换结果,
-    /// 用这个开关补上;若互换已在 keyd/udev 层完成则不要开。
+    /// Swap caps and esc on the capture side; only affects keys sent to the
+    /// remote. When the swap lives in the xkb layer (above evdev), the
+    /// remote side never sees it, so this flag redoes it. Do not enable it
+    /// if keyd or udev already does the swap.
     pub swap_caps_esc: bool,
 }
 
 const USAGE: &str = "\
-hidpipe-server — Linux 输入捕获端
+hidpipe-server: Linux input capture side
 
-用法: hidpipe-server [选项]
+Usage: hidpipe-server [options]
 
-选项:
-  --bind <地址>        监听地址 (默认 0.0.0.0)
-  --port <端口>        监听端口 (默认 24800)
-  --keyboard <子串>    键盘设备名匹配 (默认自动探测,优先 keyd 虚拟键盘)
-  --mouse <子串>       鼠标设备名匹配 (默认自动探测)
-  --switch-key <键名>  本地/远程切换键 (默认 scrolllock,可选名见下)
-  --probe              探键模式:按什么打印什么,用于选切换键
-  --no-barrier         禁用屏幕右缘屏障,只用热键切换
-  --swap-caps-esc      发往远端的按键做 caps ↔ esc 互换
-  -h, --help           显示本帮助
+Options:
+  --bind <addr>        listen address (default 0.0.0.0)
+  --port <port>        listen port (default 24800)
+  --keyboard <substr>  match keyboard device name (default auto-detect, prefers the keyd virtual keyboard)
+  --mouse <substr>     match mouse device name (default auto-detect)
+  --switch-key <name>  local/remote switch key (default scrolllock, names below)
+  --probe              key probe mode: print what you press, for picking a switch key
+  --no-barrier         disable the right-edge barrier, hotkey only
+  --swap-caps-esc      swap caps and esc for keys sent to the remote
+  -h, --help           show this help
 
-需要读 /dev/input/event* 的权限(input 组或 root)。
+Needs read access to /dev/input/event* (input group or root).
 
---switch-key 可选键名:
+--switch-key accepts:
   scrolllock | pause | printscreen | menu | compose
   insert | delete | home | end | pageup | pagedown
   kpenter | kpplus | kpminus | f1..f24
@@ -60,7 +64,7 @@ impl Args {
         while let Some(arg) = it.next() {
             let mut take = |flag: &str| -> String {
                 it.next().unwrap_or_else(|| {
-                    eprintln!("{flag} 缺少参数值\n{USAGE}");
+                    eprintln!("{flag} requires a value\n{USAGE}");
                     std::process::exit(2);
                 })
             };
@@ -68,7 +72,7 @@ impl Args {
                 "--bind" => args.bind = take("--bind"),
                 "--port" => {
                     args.port = take("--port").parse().unwrap_or_else(|_| {
-                        eprintln!("--port 不是合法端口号\n{USAGE}");
+                        eprintln!("--port is not a valid port number\n{USAGE}");
                         std::process::exit(2);
                     })
                 }
@@ -83,7 +87,7 @@ impl Args {
                     std::process::exit(0);
                 }
                 other => {
-                    eprintln!("未知参数 {other}\n{USAGE}");
+                    eprintln!("unknown argument {other}\n{USAGE}");
                     std::process::exit(2);
                 }
             }
@@ -114,7 +118,7 @@ fn parse_switch_key(name: &str) -> Key {
     if let Some(key) = fixed {
         return key;
     }
-    // F1..F12 的 evdev 编码是 59..=68,F13..F24 是 183..=194。
+    // F1..F12 encode as 59..=68 in evdev, F13..F24 as 183..=194.
     if let Some(n) = name.strip_prefix('f').and_then(|s| s.parse::<u16>().ok()) {
         return match n {
             1..=12 => Key::new(58 + n),
@@ -126,6 +130,6 @@ fn parse_switch_key(name: &str) -> Key {
 }
 
 fn unknown_key(name: &str) -> ! {
-    eprintln!("不支持的切换键 {name},可选键名见 --help");
+    eprintln!("unsupported switch key {name}, see --help for names");
     std::process::exit(2);
 }

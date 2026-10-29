@@ -1,10 +1,13 @@
-//! hidpipe-server: Linux 捕获端。
+//! hidpipe-server: Linux capture side.
 //!
-//! 职责只有三件:
-//! 1. 从 evdev 读原始输入(键盘优先选 keyd 虚拟设备,即本地改键之后的确定来源);
-//! 2. 热键切换本地/远程模式。远程模式下 EVIOCGRAB 独占键鼠,
-//!    事件翻译成 HID usage ID 帧发给 macOS 注入端;
-//! 3. 断线即 ungrab——grab 状态随连接死亡释放,绝不残留。
+//! Responsibilities:
+//! 1. Read raw input from evdev. The preferred keyboard source is the keyd
+//!    virtual device, the definitive source after local remapping.
+//! 2. Toggle local/remote mode with a hotkey. In remote mode, EVIOCGRAB
+//!    grabs keyboard and mouse, and events are translated into HID usage ID
+//!    frames for the macOS injector.
+//! 3. Ungrab on disconnect. Grab state is released when the connection dies,
+//!    never left behind.
 
 #![forbid(unsafe_code)]
 
@@ -45,8 +48,8 @@ enum DeviceKind {
 impl DeviceKind {
     fn name(self) -> &'static str {
         match self {
-            DeviceKind::Keyboard => "键盘",
-            DeviceKind::Mouse => "鼠标",
+            DeviceKind::Keyboard => "keyboard",
+            DeviceKind::Mouse => "mouse",
         }
     }
 }
@@ -56,16 +59,16 @@ fn main() -> io::Result<()> {
     let (kbd, kbd_path) = open_device(DeviceKind::Keyboard, args.keyboard.as_deref())?;
     let (mouse, mouse_path) = open_device(DeviceKind::Mouse, args.mouse.as_deref())?;
     log!(
-        "键盘: {} ({})",
+        "keyboard: {} ({})",
         kbd.name().unwrap_or("?"),
         kbd_path.display()
     );
     log!(
-        "鼠标: {} ({})",
+        "mouse: {} ({})",
         mouse.name().unwrap_or("?"),
         mouse_path.display()
     );
-    log!("切换键: {:?} | 端口: {}", args.switch_key, args.port);
+    log!("switch key: {:?} | port: {}", args.switch_key, args.port);
     set_nonblocking(&kbd)?;
     set_nonblocking(&mouse)?;
 
@@ -109,14 +112,15 @@ fn main() -> io::Result<()> {
 struct App {
     kbd: Device,
     mouse: Device,
-    /// 已通过握手、正在服役的连接。
+    /// Connection that passed the handshake and is now serving.
     conn: Option<Connection>,
-    /// 刚 accept、尚未通过握手的候选连接。它与服役连接隔离,
-    /// 只有收到合法 Hello 才能顶岗。
+    /// Freshly accepted connection that has not passed the handshake yet.
+    /// It is kept separate from the serving connection and can only take
+    /// over after a valid Hello.
     pending: Option<(Connection, SocketAddr)>,
     conn_id: u64,
     mode: Mode,
-    /// SYN_REPORT 之间累加的相对量。
+    /// Relative motion accumulated between SYN_REPORTs.
     motion: (i64, i64),
     wheel: (i64, i64),
     switch_key: Key,
@@ -126,21 +130,24 @@ struct App {
     net_tx: mpsc::Sender<NetMsg>,
     net_rx: mpsc::Receiver<NetMsg>,
     barrier_rx: mpsc::Receiver<BarrierEvent>,
-    /// 屏障武装状态:进入远程模式后解除,指针离开屏障后重新武装。
-    /// 防止从远程切回本地时指针还停在屏障上,立刻又弹回远程。
+    /// Barrier arming state: disarmed on entering remote mode, re-armed when
+    /// the pointer leaves the barrier. Prevents an immediate bounce back to
+    /// remote when the pointer still sits on the barrier after switching
+    /// back to local.
     armed: bool,
 }
 
 impl App {
-    /// 新连接先进入候选区等待握手,不直接顶岗;
-    /// 旧候选被顶替后随 channel 断开自行消亡。
+    /// A new connection waits in the pending slot for the handshake instead
+    /// of taking over directly. A replaced pending connection dies on its
+    /// own when its channel closes.
     fn accept_pending(&mut self) {
         while let Ok((stream, addr)) = self.listener.accept() {
-            log!("候选连接: {addr}");
+            log!("pending connection: {addr}");
             self.conn_id += 1;
             match Connection::spawn(stream, self.net_tx.clone(), self.conn_id) {
                 Ok(conn) => self.pending = Some((conn, addr)),
-                Err(e) => log!("连接初始化失败: {e}"),
+                Err(e) => log!("connection setup failed: {e}"),
             }
         }
     }
@@ -150,26 +157,27 @@ impl App {
             match msg {
                 NetMsg::Hello(id) => {
                     if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
-                        let (conn, addr) = self.pending.take().expect("刚检查过存在");
-                        log!("客户端就绪: {addr}");
-                        // 通过握手的连接顶岗是允许的:这正是客户端重启重连的路径。
+                        let (conn, addr) = self.pending.take().expect("checked above");
+                        log!("client ready: {addr}");
+                        // A handshaken connection is allowed to take over;
+                        // this is the reconnect path after a client restart.
                         self.conn = Some(conn);
                     }
                 }
                 NetMsg::Dead(id) => {
                     if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
-                        log!("候选连接未通过握手,已丢弃");
+                        log!("pending connection failed handshake, dropped");
                         self.pending = None;
                     }
                     if self.conn.as_ref().is_some_and(|c| c.id == id) {
-                        log!("连接死亡,回到本地模式");
+                        log!("connection dead, back to local mode");
                         self.conn = None;
                         self.leave_remote();
                     }
                 }
                 NetMsg::ReturnToLocal(id) => {
                     if self.conn.as_ref().is_some_and(|c| c.id == id) && self.mode == Mode::Remote {
-                        log!("对端边缘触发,交还控制");
+                        log!("peer edge trigger, handing control back");
                         self.send(Frame::ReleaseAll);
                         self.leave_remote();
                     }
@@ -179,7 +187,8 @@ impl App {
     }
 
     fn drain_barrier(&mut self) {
-        // 先收齐事件再处理,避免 try_recv 的不可变借用卡住 &mut self。
+        // Collect events before handling, otherwise try_recv's immutable
+        // borrow blocks &mut self.
         let mut events = Vec::new();
         while let Ok(event) = self.barrier_rx.try_recv() {
             events.push(event);
@@ -202,8 +211,10 @@ impl App {
             Ok(events) => events,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
-                // 设备被拔掉等硬错误:回本地模式等人工处理,好过静默丢输入。
-                log!("键盘读取失败({e}),回到本地模式");
+                // Hard errors such as an unplugged device: fall back to local
+                // mode and wait for manual intervention, better than silently
+                // losing input.
+                log!("keyboard read failed ({e}), back to local mode");
                 self.leave_remote();
                 return;
             }
@@ -220,7 +231,7 @@ impl App {
             Ok(events) => events,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
-                log!("鼠标读取失败({e}),回到本地模式");
+                log!("mouse read failed ({e}), back to local mode");
                 self.leave_remote();
                 return;
             }
@@ -235,12 +246,12 @@ impl App {
         }
     }
 
-    /// value: 0 = 松开,1 = 按下,2 = 长按重复。
+    /// value: 0 = release, 1 = press, 2 = hold repeat.
     fn on_key(&mut self, key: Key, value: i32) {
         if self.probe {
-            // 探键模式只报名字,不做任何切换/转发。
+            // Probe mode only reports key names; no switching or forwarding.
             if value == 1 {
-                log!("按下: {key:?}");
+                log!("pressed: {key:?}");
             }
             return;
         }
@@ -248,7 +259,8 @@ impl App {
             if value == 1 {
                 self.toggle_mode();
             }
-            // 切换键本身不透传——它是本机的控制面,不属于数据面。
+            // The switch key itself is never forwarded; it belongs to the
+            // local control plane, not the data plane.
             return;
         }
         if self.mode != Mode::Remote {
@@ -261,7 +273,7 @@ impl App {
         };
         let Some(usage) = hid::evdev_to_hid(key) else {
             if value == 1 {
-                log!("未映射按键,已忽略: {key:?}");
+                log!("unmapped key ignored: {key:?}");
             }
             return;
         };
@@ -281,7 +293,7 @@ impl App {
             Key::BTN_LEFT => MouseButton::Left,
             Key::BTN_RIGHT => MouseButton::Right,
             Key::BTN_MIDDLE => MouseButton::Middle,
-            // 侧键等 v0 不转发。
+            // Side buttons are not forwarded in v0.
             _ => return,
         };
         let state = if value == 1 {
@@ -305,7 +317,8 @@ impl App {
         }
     }
 
-    /// 每个上报周期把累加的相对量发出去——一次 SYN 一帧,而非每个事件一帧。
+    /// Send the accumulated relative motion once per report cycle: one frame
+    /// per SYN, not one frame per event.
     fn flush_motion(&mut self) {
         if self.mode != Mode::Remote {
             return;
@@ -332,22 +345,23 @@ impl App {
         match self.mode {
             Mode::Local => {
                 if self.conn.is_none() {
-                    log!("尚无客户端连接,保持本地模式");
+                    log!("no client connected, staying local");
                     return;
                 }
                 if let Err(e) = self.kbd.grab().and_then(|()| self.mouse.grab()) {
-                    log!("grab 失败,保持本地模式: {e}");
+                    log!("grab failed, staying local: {e}");
                     self.ungrab_all();
                     return;
                 }
                 self.mode = Mode::Remote;
-                log!("→ 远程模式:输入发往 macOS");
+                log!("-> remote mode: input goes to macOS");
             }
             Mode::Remote => {
-                // 先让对端释放所有按键,再松开 grab,顺序不能反。
+                // Tell the peer to release all keys before ungrabbing;
+                // the order matters.
                 self.send(Frame::ReleaseAll);
                 self.leave_remote();
-                log!("→ 本地模式");
+                log!("-> local mode");
             }
         }
     }
@@ -373,9 +387,11 @@ impl App {
     }
 }
 
-/// 按名字子串匹配设备;未指定时按能力自动探测:
-/// 键盘要求有字母/回车/空格,鼠标要求有相对轴和左键。
-/// 键盘候选中优先 keyd 虚拟设备(本地改键的下游,拿到的是改后的确定结果)。
+/// Match a device by name substring; without a filter, auto-detect by
+/// capability: a keyboard must have letter/enter/space keys, a mouse must
+/// have relative axes and a left button. Among keyboard candidates the keyd
+/// virtual device wins, since it sits downstream of local remapping and
+/// yields the final key codes.
 fn open_device(kind: DeviceKind, name_filter: Option<&str>) -> io::Result<(Device, PathBuf)> {
     let filter = name_filter.map(str::to_lowercase);
     let mut fallback: Option<(Device, PathBuf)> = None;
@@ -402,7 +418,7 @@ fn open_device(kind: DeviceKind, name_filter: Option<&str>) -> io::Result<(Devic
     fallback.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("找不到匹配的{}设备", kind.name()),
+            format!("no matching {} device found", kind.name()),
         )
     })
 }
@@ -421,13 +437,13 @@ fn is_mouse(dev: &Device) -> bool {
         .is_some_and(|keys| keys.contains(Key::BTN_LEFT))
 }
 
-/// fetch_events 的迭代器借用设备本身;收成 Vec 再返回,
-/// 调用方才能一边持有事件一边操作 self。
+/// fetch_events borrows the device for its iterator; collecting into a Vec
+/// lets the caller hold the events while mutating self.
 fn fetch_all(dev: &mut Device) -> io::Result<Vec<evdev::InputEvent>> {
     Ok(dev.fetch_events()?.collect())
 }
 
-/// evdev 0.12 未暴露非阻塞设置,直接对 fd 做 fcntl。
+/// evdev 0.12 does not expose nonblocking mode, so fcntl the fd directly.
 fn set_nonblocking(dev: &Device) -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     fcntl(dev.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io::Error::from)?;

@@ -1,5 +1,6 @@
-//! 协议编解码的往返一致性:线上格式是本系统唯一的跨机契约,
-//! 任何一端重构实现后,这组测试保证契约不变。
+//! Roundtrip consistency for the protocol codec. The wire format is the
+//! only cross-machine contract in this system; these tests keep the
+//! contract stable across refactors of either end.
 
 use hidpipe_proto::{decode, encode, payload_len, ButtonState, Frame, KeyState, MouseButton};
 
@@ -51,19 +52,23 @@ fn cases() -> Vec<Frame> {
 fn encode_decode_roundtrip() {
     for frame in cases() {
         let bytes = encode(&frame);
-        let (tag, payload) = bytes.split_first().expect("帧至少含 tag");
+        let (tag, payload) = bytes.split_first().expect("a frame has at least a tag");
         assert_eq!(
             payload_len(*tag).unwrap(),
             payload.len(),
-            "长度与 tag 不符: {frame:?}"
+            "payload length does not match tag: {frame:?}"
         );
-        assert_eq!(decode(*tag, payload), Some(frame), "往返不一致: {frame:?}");
+        assert_eq!(
+            decode(*tag, payload),
+            Some(frame),
+            "roundtrip mismatch: {frame:?}"
+        );
     }
 }
 
 #[test]
 fn rejects_garbage() {
     assert_eq!(payload_len(0xff), None);
-    assert_eq!(decode(0x01, &[0x00]), None); // 长度不符
+    assert_eq!(decode(0x01, &[0x00]), None); // wrong length
     assert_eq!(decode(0xff, &[]), None);
 }

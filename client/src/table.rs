@@ -1,16 +1,18 @@
-//! USB HID keyboard page (0x07) usage ID → macOS CGKeyCode。
+//! USB HID keyboard page (0x07) usage ID -> macOS CGKeyCode.
 //!
-//! 纯静态查表,无状态。CGKeyCode 即 HIToolbox/Events.h 里的 kVK_*
-//! 虚拟键码(ANSI 布局)。注意 F13/F14/F15/F16 的编号顺序是 ADB 的
-//! 历史遗留(F16=0x6A 在 F14=0x6B 之前),不是笔误。
+//! A pure static table with no state. CGKeyCode is the kVK_* virtual key
+//! code from HIToolbox/Events.h (ANSI layout). The numbering order of
+//! F13/F14/F15/F16 is an ADB historical leftover (F16=0x6A comes before
+//! F14=0x6B), not a typo.
 //!
-//! 未收录的 usage(媒体键、Menu 等)返回 None,由调用方忽略。
+//! Usages not listed here (media keys, Menu, etc.) return None and are
+//! ignored by the caller.
 
 use core_graphics::event::CGKeyCode;
 
 pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
     Some(match usage {
-        // 字母区:HID 0x04..=0x1d 是 a..z
+        // Letters: HID 0x04..=0x1d is a..z
         0x04 => 0x00, // A
         0x05 => 0x0B, // B
         0x06 => 0x08, // C
@@ -37,7 +39,7 @@ pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
         0x1B => 0x07, // X
         0x1C => 0x10, // Y
         0x1D => 0x06, // Z
-        // 数字区
+        // Number row
         0x1E => 0x12, // 1
         0x1F => 0x13, // 2
         0x20 => 0x14, // 3
@@ -48,7 +50,7 @@ pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
         0x25 => 0x1C, // 8
         0x26 => 0x19, // 9
         0x27 => 0x1D, // 0
-        // 编辑与控制区
+        // Editing and control keys
         0x28 => 0x24, // Enter → Return
         0x29 => 0x35, // Escape
         0x2A => 0x33, // Backspace → Delete
@@ -66,7 +68,7 @@ pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
         0x37 => 0x2F, // .
         0x38 => 0x2C, // /
         0x39 => 0x39, // CapsLock
-        // 功能键
+        // Function keys
         0x3A => 0x7A, // F1
         0x3B => 0x78, // F2
         0x3C => 0x63, // F3
@@ -79,11 +81,12 @@ pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
         0x43 => 0x6C, // F10
         0x44 => 0x67, // F11
         0x45 => 0x6F, // F12
-        // macOS 没有 PrintScreen/ScrollLock/Pause,映射到不常用的 F13-F15
+        // macOS has no PrintScreen/ScrollLock/Pause; map them to the rarely
+        // used F13-F15
         0x46 => 0x69, // PrintScreen → F13
         0x47 => 0x6B, // ScrollLock → F14
         0x48 => 0x71, // Pause → F15
-        // 导航区
+        // Navigation cluster
         0x49 => 0x72, // Insert → Help
         0x4A => 0x73, // Home
         0x4B => 0x74, // PageUp
@@ -94,7 +97,7 @@ pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
         0x50 => 0x7B, // Left
         0x51 => 0x7D, // Down
         0x52 => 0x7E, // Up
-        // 小键盘
+        // Keypad
         0x53 => 0x47, // NumLock → KeypadClear
         0x54 => 0x4B, // KP /
         0x55 => 0x43, // KP *
@@ -113,7 +116,7 @@ pub fn hid_to_mac(usage: u16) -> Option<CGKeyCode> {
         0x62 => 0x52, // KP 0
         0x63 => 0x41, // KP .
         0x67 => 0x51, // KP =
-        // 修饰键:Linux Super → macOS Command,Alt → Option,Ctrl → Control
+        // Modifiers: Linux Super -> macOS Command, Alt -> Option, Ctrl -> Control
         0xE0 => 0x3B, // LeftControl
         0xE1 => 0x38, // LeftShift
         0xE2 => 0x3A, // LeftAlt → Option

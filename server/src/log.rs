@@ -1,5 +1,6 @@
-//! 运行日志:统一带本地时间戳,格式 [HH:MM:SS]。
-//! main.rs 以 `#[macro_use] mod log;` 引入,各模块直接用 `log!`。
+//! Runtime logging with a local timestamp, format [HH:MM:SS].
+//! main.rs pulls this in with `#[macro_use] mod log;` so every module can
+//! call `log!`.
 
 pub fn timestamp() -> String {
     let fmt = time::macros::format_description!("[hour]:[minute]:[second]");

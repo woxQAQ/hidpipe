@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["proto", "server", "client"]
-# client 只能在 macOS 上构建,server 只能在 Linux 上构建;
-# 默认成员取本机(Linux)可构建的子集,对端包用 `cargo build -p` 显式构建。
+# The client only builds on macOS, the server only on Linux.
+# default-members covers what this machine (Linux) can build; use
+# `cargo build -p` for the other side's package.
 default-members = ["proto", "server"]
 
 [workspace.package]

@@ -1,9 +1,10 @@
-//! Wayland 边缘屏障:在每个输出的右缘放一条 1px 全透明 layer-shell surface。
-//! 指针进入时 compositor 发 pointer enter——这是协议背书的精确边缘检测,
-//! 不靠位移累加估算光标位置,因此零漂移。
+//! Wayland edge barrier: a 1px fully transparent layer-shell surface on the
+//! right edge of every output. When the pointer enters, the compositor sends
+//! a pointer enter event. This is precise, protocol-backed edge detection
+//! instead of delta-accumulation cursor estimation, so it cannot drift.
 //!
-//! 本模块运行在独立线程里(wayland 事件循环是阻塞式的),
-//! 通过 channel 向主循环上报 Enter/Leave。
+//! This module runs on its own thread (the wayland event loop is blocking)
+//! and reports Enter/Leave to the main loop over a channel.
 
 use std::error::Error;
 use std::fs::File;
@@ -26,16 +27,17 @@ pub enum BarrierEvent {
     Leave,
 }
 
-/// 启动屏障线程。无 Wayland 会话时安静退出(退化为纯热键切换);
-/// 断连自动重试,compositor 重启不至于拖垮输入管道。
+/// Start the barrier thread. Without a Wayland session it exits quietly
+/// and switching falls back to hotkey only. Reconnects automatically on
+/// disconnect, so a compositor restart does not take down the input pipe.
 pub fn spawn(tx: Sender<BarrierEvent>) {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        log!("(barrier) 无 WAYLAND_DISPLAY,边缘切换不可用,仅热键");
+        log!("(barrier) no WAYLAND_DISPLAY, edge switching unavailable, hotkey only");
         return;
     }
     thread::spawn(move || loop {
         if let Err(e) = run(tx.clone()) {
-            log!("(barrier) 与 compositor 断开({e}),5s 后重连");
+            log!("(barrier) lost compositor ({e}), reconnecting in 5s");
         }
         thread::sleep(Duration::from_secs(5));
     });
@@ -50,12 +52,15 @@ fn run(tx: Sender<BarrierEvent>) -> Result<(), Box<dyn Error>> {
     let mut state = State::new(tx);
     queue.roundtrip(&mut state)?;
     if state.layer_shell.is_none() {
-        return Err("compositor 不支持 layer-shell".into());
+        return Err("compositor does not support layer-shell".into());
     }
     state.create_barriers(&qh);
-    // 再 roundtrip 一次,拿到 seat capabilities 与首次 configure。
+    // One more roundtrip to get seat capabilities and the first configure.
     queue.roundtrip(&mut state)?;
-    log!("(barrier) 边缘屏障就位:右缘 × {}", state.barriers.len());
+    log!(
+        "(barrier) edge barrier in place: right edge x {}",
+        state.barriers.len()
+    );
 
     loop {
         queue.blocking_dispatch(&mut state)?;
@@ -76,7 +81,8 @@ struct State {
 struct Barrier {
     surface: wl_surface::WlSurface,
     layer: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    /// 全零像素即全透明;文件句柄必须和 buffer 同寿命。
+    /// An all-zero pixel is fully transparent; the file handle must live
+    /// as long as the buffer.
     backing: Option<(File, wl_buffer::WlBuffer)>,
     height: u32,
 }
@@ -110,7 +116,8 @@ impl State {
                 (),
             );
             use zwlr_layer_surface_v1::Anchor;
-            // 贴住右缘、上下拉满;1px 宽。不独占空间、不要键盘焦点。
+            // Anchor to the right edge and stretch top to bottom; 1px wide.
+            // No exclusive space, no keyboard focus.
             layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Right);
             layer.set_size(1, 0);
             layer.set_exclusive_zone(0);
@@ -130,15 +137,16 @@ impl State {
     }
 }
 
-/// 无 buffer 的 surface 输入区域为空,吃不到指针事件;
-/// 附一张全零(全透明)的 shm buffer 撑出几何形状。
+/// A surface without a buffer has an empty input region and receives no
+/// pointer events; attach an all-zero (fully transparent) shm buffer to
+/// give it geometry.
 fn make_transparent_buffer(
     shm: &wl_shm::WlShm,
     height: u32,
     qh: &QueueHandle<State>,
 ) -> Result<(File, wl_buffer::WlBuffer), Box<dyn Error>> {
     let height = height.max(1);
-    let size = u64::from(height) * 4; // 1px 宽,ARGB8888
+    let size = u64::from(height) * 4; // 1px wide, ARGB8888
     let file = unlinked_tempfile()?;
     file.set_len(size)?;
     let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
@@ -146,14 +154,15 @@ fn make_transparent_buffer(
     Ok((file, buffer))
 }
 
-/// 创建后立即 unlink 的临时文件:fd 依然有效,文件系统里不留痕。
+/// A tempfile unlinked right after creation: the fd stays valid, the
+/// filesystem keeps no trace.
 fn unlinked_tempfile() -> std::io::Result<File> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let path = dir.join(format!("hidpipe-barrier-{}", std::process::id()));
-    // 必须 O_RDWR:compositor 会以只读方式 mmap 这个 fd,
-    // File::create 的 O_WRONLY 会让 mmap 直接失败(协议错误 2)。
+    // O_RDWR is required: the compositor mmaps this fd read-only, and
+    // File::create's O_WRONLY makes that mmap fail (protocol error 2).
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -267,7 +276,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
             match make_transparent_buffer(&shm, height, qh) {
                 Ok(backing) => barrier.backing = Some(backing),
                 Err(e) => {
-                    log!("(barrier) buffer 创建失败: {e}");
+                    log!("(barrier) buffer creation failed: {e}");
                     return;
                 }
             }
@@ -280,7 +289,8 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
     }
 }
 
-// 以下对象我们不关心其事件,但 wayland-client 要求每个已创建对象都有 Dispatch。
+// We do not care about these objects' events, but wayland-client requires
+// a Dispatch impl for every created object.
 macro_rules! empty_dispatch {
     ($($t:ty),*) => {
         $(

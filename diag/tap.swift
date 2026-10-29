@@ -1,9 +1,13 @@
-// 事件诊断:在 HID 层监听鼠标/键盘事件,打印类型与修饰键标志。
-// 用于定位"左键变右键"——看 hidpipe 注入的左键点击到底带不带 Control。
+// Event diagnostic: listens for mouse and keyboard events at the HID
+// level and prints the type and modifier flags.
+// Used to track down "left click becomes right click": does the left
+// click injected by hidpipe carry Control or not.
 //
-// 用法(在已授权辅助功能的终端里,与 hidpipe-client 同时运行):
+// Usage (in a terminal that already has Accessibility access, run
+// alongside hidpipe-client):
 //   swift diag/tap.swift
-// 然后在远程模式下:左键点一次、右键点一次、按一个字母键,Ctrl-C 结束。
+// Then in remote mode: left click once, right click once, press a letter
+// key, Ctrl-C to stop.
 import CoreGraphics
 import Foundation
 
@@ -45,11 +49,11 @@ guard
         userInfo: nil
     )
 else {
-    print("无法创建事件监听——请在 辅助功能/输入监听 中授权本终端")
+    print("failed to create event tap; grant this terminal access in Accessibility / Input Monitoring")
     exit(1)
 }
 
 let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
 CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-print("监听中。flags 含义: 0x40000=Control 0x20000=Shift 0x80000=Option 0x100000=Command")
+print("Listening. flags: 0x40000=Control 0x20000=Shift 0x80000=Option 0x100000=Command")
 RunLoop.main.run()

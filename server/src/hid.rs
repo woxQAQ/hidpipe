@@ -1,7 +1,8 @@
-//! evdev key code → USB HID keyboard page (0x07) usage ID。
+//! evdev key code -> USB HID keyboard page (0x07) usage ID.
 //!
-//! 纯静态查表,无状态。未收录的键(媒体键等)返回 None,由调用方忽略;
-//! 宁可不转发,也不猜映射。
+//! A pure static table with no state. Keys not listed here (media keys
+//! etc.) return None and are ignored by the caller. We never guess a
+//! mapping.
 
 use evdev::Key;
 
