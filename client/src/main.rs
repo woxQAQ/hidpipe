@@ -31,10 +31,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// 每格滚轮折算的行数,对齐 macOS 原生鼠标的手感。
 const LINES_PER_NOTCH: i32 = 3;
-/// 返程触发阈值:光标钳制在左缘后,持续左推累计超过该位移(px)
-/// 才交还控制。阈值保证只有故意的“推穿边缘”会触发,
-/// 日常贴着左缘的正常操作不会。
-const RETURN_PUSH_THRESHOLD: i32 = 600;
+/// 返程触发:光标钳制在左缘时,时间窗内累计左推量超过阈值才交还控制。
+/// 用滑动窗求和而非“反向即清零”:高精度鼠标在边缘压住时
+/// 会不断产出 ±1 的抖动,硬清零会让触发变成纯运气。
+const RETURN_PUSH_THRESHOLD: i32 = 500;
+const RETURN_PUSH_WINDOW: Duration = Duration::from_millis(1500);
 
 /// 运行日志统一带本地时间戳,格式 [HH:MM:SS]。
 macro_rules! log {
@@ -93,8 +94,8 @@ struct Injector {
     pressed_keys: HashSet<u16>,
     pressed_buttons: HashSet<MouseButton>,
     flip_scroll: bool,
-    /// 光标钳制在左缘期间累计的继续左推位移,用于返程触发。
-    edge_push: i32,
+    /// 光标钳制在左缘期间的左推量时间窗,(时刻, 位移)。
+    edge_pushes: std::collections::VecDeque<(std::time::Instant, i32)>,
 }
 
 impl Injector {
@@ -106,7 +107,7 @@ impl Injector {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             flip_scroll,
-            edge_push: 0,
+            edge_pushes: std::collections::VecDeque::new(),
         }
     }
 
@@ -179,17 +180,29 @@ impl Injector {
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
         event.post(CGEventTapLocation::HID);
 
-        // 返程边缘检测:光标已钳制在左缘、未按任何按钮、仍在左推,
-        // 三者同时成立才累计——拖动窗口/拖选贴着左缘不会误触。
-        if p.x <= b.origin.x && dx < 0 && self.pressed_buttons.is_empty() {
-            self.edge_push += i32::from(-dx);
-            if self.edge_push > RETURN_PUSH_THRESHOLD {
-                self.edge_push = 0;
+        // 返程边缘检测:光标钳制在左缘、未按任何按钮时,
+        // 左推量进时间窗;右移只是不进窗,不清零(容忍手抖)。
+        // 光标一旦离开左缘(正常往里用),才清空窗口。
+        if p.x <= b.origin.x && self.pressed_buttons.is_empty() {
+            if dx < 0 {
+                self.edge_pushes
+                    .push_back((std::time::Instant::now(), i32::from(-dx)));
+            }
+            while self
+                .edge_pushes
+                .front()
+                .is_some_and(|(t, _)| t.elapsed() > RETURN_PUSH_WINDOW)
+            {
+                self.edge_pushes.pop_front();
+            }
+            let pushed: i32 = self.edge_pushes.iter().map(|(_, v)| v).sum();
+            if pushed > RETURN_PUSH_THRESHOLD {
+                self.edge_pushes.clear();
                 log!("光标推穿左缘,交还控制");
                 return Some(Frame::ReturnToLocal);
             }
         } else {
-            self.edge_push = 0;
+            self.edge_pushes.clear();
         }
         None
     }
