@@ -13,7 +13,7 @@ mod hid;
 mod net;
 
 use std::io;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -25,6 +25,21 @@ use hidpipe_proto::{ButtonState, Frame, KeyState, MouseButton};
 
 use args::Args;
 use net::{Connection, NetMsg};
+
+/// 运行日志统一带本地时间戳,格式 [HH:MM:SS]。
+macro_rules! log {
+    ($($arg:tt)*) => {
+        eprintln!("[{}] {}", timestamp(), format_args!($($arg)*))
+    };
+}
+
+fn timestamp() -> String {
+    let fmt = time::macros::format_description!("[hour]:[minute]:[second]");
+    time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        .format(&fmt)
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -51,17 +66,17 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
     let (kbd, kbd_path) = open_device(DeviceKind::Keyboard, args.keyboard.as_deref())?;
     let (mouse, mouse_path) = open_device(DeviceKind::Mouse, args.mouse.as_deref())?;
-    eprintln!(
+    log!(
         "键盘: {} ({})",
         kbd.name().unwrap_or("?"),
         kbd_path.display()
     );
-    eprintln!(
+    log!(
         "鼠标: {} ({})",
         mouse.name().unwrap_or("?"),
         mouse_path.display()
     );
-    eprintln!("切换键: {:?} | 端口: {}", args.switch_key, args.port);
+    log!("切换键: {:?} | 端口: {}", args.switch_key, args.port);
     set_nonblocking(&kbd)?;
     set_nonblocking(&mouse)?;
 
@@ -73,6 +88,7 @@ fn main() -> io::Result<()> {
         kbd,
         mouse,
         conn: None,
+        pending: None,
         conn_id: 0,
         mode: Mode::Local,
         motion: (0, 0),
@@ -96,7 +112,11 @@ fn main() -> io::Result<()> {
 struct App {
     kbd: Device,
     mouse: Device,
+    /// 已通过握手、正在服役的连接。
     conn: Option<Connection>,
+    /// 刚 accept、尚未通过握手的候选连接。它与服役连接隔离,
+    /// 只有收到合法 Hello 才能顶岗。
+    pending: Option<(Connection, SocketAddr)>,
     conn_id: u64,
     mode: Mode,
     /// SYN_REPORT 之间累加的相对量。
@@ -110,25 +130,41 @@ struct App {
 }
 
 impl App {
-    /// 新连接直接顶掉旧连接;旧线程会自行退出,其迟到的 Dead 携带旧代数,
-    /// 在 handle_net_msgs 里被忽略。
+    /// 新连接先进入候选区等待握手,不直接顶岗;
+    /// 旧候选被顶替后随 channel 断开自行消亡。
     fn accept_pending(&mut self) {
         while let Ok((stream, addr)) = self.listener.accept() {
-            eprintln!("客户端接入: {addr}");
+            log!("候选连接: {addr}");
             self.conn_id += 1;
             match Connection::spawn(stream, self.net_tx.clone(), self.conn_id) {
-                Ok(conn) => self.conn = Some(conn),
-                Err(e) => eprintln!("连接初始化失败: {e}"),
+                Ok(conn) => self.pending = Some((conn, addr)),
+                Err(e) => log!("连接初始化失败: {e}"),
             }
         }
     }
 
     fn handle_net_msgs(&mut self) {
-        while let Ok(NetMsg::Dead(id)) = self.net_rx.try_recv() {
-            if self.conn.as_ref().is_some_and(|c| c.id == id) {
-                eprintln!("连接死亡,回到本地模式");
-                self.conn = None;
-                self.leave_remote();
+        while let Ok(msg) = self.net_rx.try_recv() {
+            match msg {
+                NetMsg::Hello(id) => {
+                    if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
+                        let (conn, addr) = self.pending.take().expect("刚检查过存在");
+                        log!("客户端就绪: {addr}");
+                        // 通过握手的连接顶岗是允许的:这正是客户端重启重连的路径。
+                        self.conn = Some(conn);
+                    }
+                }
+                NetMsg::Dead(id) => {
+                    if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
+                        log!("候选连接未通过握手,已丢弃");
+                        self.pending = None;
+                    }
+                    if self.conn.as_ref().is_some_and(|c| c.id == id) {
+                        log!("连接死亡,回到本地模式");
+                        self.conn = None;
+                        self.leave_remote();
+                    }
+                }
             }
         }
     }
@@ -139,7 +175,7 @@ impl App {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
                 // 设备被拔掉等硬错误:回本地模式等人工处理,好过静默丢输入。
-                eprintln!("键盘读取失败({e}),回到本地模式");
+                log!("键盘读取失败({e}),回到本地模式");
                 self.leave_remote();
                 return;
             }
@@ -156,7 +192,7 @@ impl App {
             Ok(events) => events,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
-                eprintln!("鼠标读取失败({e}),回到本地模式");
+                log!("鼠标读取失败({e}),回到本地模式");
                 self.leave_remote();
                 return;
             }
@@ -190,7 +226,7 @@ impl App {
         };
         let Some(usage) = hid::evdev_to_hid(key) else {
             if value == 1 {
-                eprintln!("未映射按键,已忽略: {key:?}");
+                log!("未映射按键,已忽略: {key:?}");
             }
             return;
         };
@@ -261,22 +297,22 @@ impl App {
         match self.mode {
             Mode::Local => {
                 if self.conn.is_none() {
-                    eprintln!("尚无客户端连接,保持本地模式");
+                    log!("尚无客户端连接,保持本地模式");
                     return;
                 }
                 if let Err(e) = self.kbd.grab().and_then(|()| self.mouse.grab()) {
-                    eprintln!("grab 失败,保持本地模式: {e}");
+                    log!("grab 失败,保持本地模式: {e}");
                     self.ungrab_all();
                     return;
                 }
                 self.mode = Mode::Remote;
-                eprintln!("→ 远程模式:输入发往 macOS");
+                log!("→ 远程模式:输入发往 macOS");
             }
             Mode::Remote => {
                 // 先让对端释放所有按键,再松开 grab,顺序不能反。
                 self.send(Frame::ReleaseAll);
                 self.leave_remote();
-                eprintln!("→ 本地模式");
+                log!("→ 本地模式");
             }
         }
     }

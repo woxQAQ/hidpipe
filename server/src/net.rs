@@ -16,6 +16,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub enum NetMsg {
+    /// 候选连接的首帧是版本匹配的 Hello,可上岗。
+    Hello(u64),
+    /// 连接已死(读超时/写失败/对端关闭/握手非法),携带连接代数。
     Dead(u64),
 }
 
@@ -65,6 +68,18 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg
 }
 
 fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>, id: u64) {
+    // 首帧必须是版本匹配的 Hello,否则立即判死。
+    // 未通过握手的连接无权顶掉已上岗的连接——这是协议级准入控制,
+    // 防止同端口的旧协议客户端(如 deskflow 的重试循环)挤掉正常连接。
+    match proto::read_frame(&mut stream) {
+        Ok(Frame::Hello { version }) if version == proto::VERSION => {
+            let _ = net_tx.send(NetMsg::Hello(id));
+        }
+        _ => {
+            let _ = net_tx.send(NetMsg::Dead(id));
+            return;
+        }
+    }
     loop {
         match proto::read_frame(&mut stream) {
             Ok(Frame::Ping) => {

@@ -32,12 +32,27 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// 每格滚轮折算的行数,对齐 macOS 原生鼠标的手感。
 const LINES_PER_NOTCH: i32 = 3;
 
+/// 运行日志统一带本地时间戳,格式 [HH:MM:SS]。
+macro_rules! log {
+    ($($arg:tt)*) => {
+        eprintln!("[{}] {}", timestamp(), format_args!($($arg)*))
+    };
+}
+
+fn timestamp() -> String {
+    let fmt = time::macros::format_description!("[hour]:[minute]:[second]");
+    time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        .format(&fmt)
+        .unwrap_or_default()
+}
+
 fn main() {
     let args = Args::parse();
     loop {
         match session(&args) {
-            Ok(()) => eprintln!("对端关闭了连接"),
-            Err(e) => eprintln!("连接中断: {e}"),
+            Ok(()) => log!("对端关闭了连接"),
+            Err(e) => log!("连接中断: {e}"),
         }
         sleep(RETRY_INTERVAL);
     }
@@ -53,7 +68,7 @@ fn session(args: &Args) -> io::Result<()> {
             version: proto::VERSION,
         },
     )?;
-    eprintln!("已连接 {}:{}", args.host, args.port);
+    log!("已连接 {}:{}", args.host, args.port);
 
     let mut injector = Injector::new(args.flip_scroll);
     loop {
@@ -97,7 +112,7 @@ impl Injector {
 
     fn key(&mut self, usage: u16, state: KeyState) {
         let Some(code) = table::hid_to_mac(usage) else {
-            eprintln!("未映射 HID usage,已忽略: {usage:#06x}");
+            log!("未映射 HID usage,已忽略: {usage:#06x}");
             return;
         };
         self.post_key(code, state != KeyState::Release, state == KeyState::Repeat);
@@ -114,7 +129,7 @@ impl Injector {
 
     fn post_key(&self, code: CGKeyCode, down: bool, autorepeat: bool) {
         let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), code, down) else {
-            eprintln!("键盘事件创建失败: {code:#06x}");
+            log!("键盘事件创建失败: {code:#06x}");
             return;
         };
         if autorepeat {
