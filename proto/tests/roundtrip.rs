@@ -7,15 +7,39 @@ fn cases() -> Vec<Frame> {
     vec![
         Frame::Hello { version: 0 },
         Frame::Hello { version: 255 },
-        Frame::Key { usage: 0x04, state: KeyState::Press },
-        Frame::Key { usage: 0xe7, state: KeyState::Release },
-        Frame::Key { usage: 0xffff, state: KeyState::Repeat },
+        Frame::Key {
+            usage: 0x04,
+            state: KeyState::Press,
+        },
+        Frame::Key {
+            usage: 0xe7,
+            state: KeyState::Release,
+        },
+        Frame::Key {
+            usage: 0xffff,
+            state: KeyState::Repeat,
+        },
         Frame::Motion { dx: 0, dy: 0 },
-        Frame::Motion { dx: i16::MIN, dy: i16::MAX },
-        Frame::Button { button: MouseButton::Left, state: ButtonState::Press },
-        Frame::Button { button: MouseButton::Right, state: ButtonState::Release },
-        Frame::Button { button: MouseButton::Middle, state: ButtonState::Press },
-        Frame::Wheel { dx: i8::MIN, dy: i8::MAX },
+        Frame::Motion {
+            dx: i16::MIN,
+            dy: i16::MAX,
+        },
+        Frame::Button {
+            button: MouseButton::Left,
+            state: ButtonState::Press,
+        },
+        Frame::Button {
+            button: MouseButton::Right,
+            state: ButtonState::Release,
+        },
+        Frame::Button {
+            button: MouseButton::Middle,
+            state: ButtonState::Press,
+        },
+        Frame::Wheel {
+            dx: i8::MIN,
+            dy: i8::MAX,
+        },
         Frame::ReleaseAll,
         Frame::Ping,
         Frame::Pong,
@@ -27,7 +51,11 @@ fn encode_decode_roundtrip() {
     for frame in cases() {
         let bytes = encode(&frame);
         let (tag, payload) = bytes.split_first().expect("帧至少含 tag");
-        assert_eq!(payload_len(*tag).unwrap(), payload.len(), "长度与 tag 不符: {frame:?}");
+        assert_eq!(
+            payload_len(*tag).unwrap(),
+            payload.len(),
+            "长度与 tag 不符: {frame:?}"
+        );
         assert_eq!(decode(*tag, payload), Some(frame), "往返不一致: {frame:?}");
     }
 }

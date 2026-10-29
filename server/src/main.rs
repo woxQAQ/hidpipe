@@ -51,8 +51,16 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
     let (kbd, kbd_path) = open_device(DeviceKind::Keyboard, args.keyboard.as_deref())?;
     let (mouse, mouse_path) = open_device(DeviceKind::Mouse, args.mouse.as_deref())?;
-    eprintln!("键盘: {} ({})", kbd.name().unwrap_or("?"), kbd_path.display());
-    eprintln!("鼠标: {} ({})", mouse.name().unwrap_or("?"), mouse_path.display());
+    eprintln!(
+        "键盘: {} ({})",
+        kbd.name().unwrap_or("?"),
+        kbd_path.display()
+    );
+    eprintln!(
+        "鼠标: {} ({})",
+        mouse.name().unwrap_or("?"),
+        mouse_path.display()
+    );
     eprintln!("切换键: {:?} | 端口: {}", args.switch_key, args.port);
     set_nonblocking(&kbd)?;
     set_nonblocking(&mouse)?;
@@ -337,7 +345,9 @@ fn is_keyboard(dev: &Device) -> bool {
 fn is_mouse(dev: &Device) -> bool {
     dev.supported_relative_axes().is_some_and(|axes| {
         axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y)
-    }) && dev.supported_keys().is_some_and(|keys| keys.contains(Key::BTN_LEFT))
+    }) && dev
+        .supported_keys()
+        .is_some_and(|keys| keys.contains(Key::BTN_LEFT))
 }
 
 /// fetch_events 的迭代器借用设备本身;收成 Vec 再返回,
@@ -349,7 +359,6 @@ fn fetch_all(dev: &mut Device) -> io::Result<Vec<evdev::InputEvent>> {
 /// evdev 0.12 未暴露非阻塞设置,直接对 fd 做 fcntl。
 fn set_nonblocking(dev: &Device) -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    fcntl(dev.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
-        .map_err(io::Error::from)?;
+    fcntl(dev.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
     Ok(())
 }

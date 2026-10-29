@@ -18,14 +18,28 @@ pub const VERSION: u8 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame {
     /// 客户端连上后发送的第一帧。
-    Hello { version: u8 },
+    Hello {
+        version: u8,
+    },
     /// 键盘事件。usage 为 USB HID page 0x07 usage ID。
-    Key { usage: u16, state: KeyState },
+    Key {
+        usage: u16,
+        state: KeyState,
+    },
     /// 一个上报周期内累加的相对位移。
-    Motion { dx: i16, dy: i16 },
-    Button { button: MouseButton, state: ButtonState },
+    Motion {
+        dx: i16,
+        dy: i16,
+    },
+    Button {
+        button: MouseButton,
+        state: ButtonState,
+    },
     /// 滚轮。dy > 0 表示滚轮向远离用户方向滚动(内容上滚)。
-    Wheel { dx: i8, dy: i8 },
+    Wheel {
+        dx: i8,
+        dy: i8,
+    },
     /// 要求对端释放所有按住的键与按钮。
     /// 切回本地或断线前发送,防止对端残留卡住的修饰键。
     ReleaseAll,
@@ -107,7 +121,9 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<Frame> {
         return None;
     }
     Some(match tag {
-        TAG_HELLO => Frame::Hello { version: payload[0] },
+        TAG_HELLO => Frame::Hello {
+            version: payload[0],
+        },
         TAG_KEY => Frame::Key {
             usage: u16::from_be_bytes([payload[0], payload[1]]),
             state: match payload[2] {
