@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 core-graphics = { version = "0.25", features = ["highsierra"] }
+# SIGTERM/SIGINT 时释放按住的键,防止系统级卡键残留。
+ctrlc = "3"
 # 日志时间戳用,纯格式化。
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 hidpipe-proto = { path = "../proto" }

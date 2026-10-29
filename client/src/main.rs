@@ -5,17 +5,21 @@
 //! 不会作用于远端按键(不会双重映射),远端按键也不依赖本地规则
 //! (不会时灵时不灵)。换键责任全部在捕获侧,恰好一次。
 //!
-//! 断线时 Drop 自动释放所有按住的键与按钮——对端不会残留卡住的修饰键。
+//! 防卡键的三道防线:
+//! 1. 会话建立时 reset_modifiers 抬一遍所有修饰键,治愈历史残留;
+//! 2. 断线时 Injector Drop 释放本会话按住的键;
+//! 3. SIGTERM/SIGINT 经共享的 PressedState 由信号线程兜底释放。
 
 #![forbid(unsafe_code)]
 
 mod table;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
@@ -29,10 +33,12 @@ use proto::{ButtonState, Frame, KeyState, MouseButton};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// HID page 0x07 的 CapsLock usage ID。
+const HID_CAPS_LOCK: u16 = 0x39;
 /// 每格滚轮折算的行数,对齐 macOS 原生鼠标的手感。
 const LINES_PER_NOTCH: i32 = 3;
 /// 返程触发:光标钳制在左缘时,时间窗内累计左推量超过阈值才交还控制。
-/// 用滑动窗求和而非“反向即清零”:高精度鼠标在边缘压住时
+/// 用滑动窗求和而非"反向即清零":高精度鼠标在边缘压住时
 /// 会不断产出 ±1 的抖动,硬清零会让触发变成纯运气。
 const RETURN_PUSH_THRESHOLD: i32 = 500;
 const RETURN_PUSH_WINDOW: Duration = Duration::from_millis(1500);
@@ -54,8 +60,22 @@ fn timestamp() -> String {
 
 fn main() {
     let args = Args::parse();
+    // 按住的键集合是可发送的纯数据,共享给信号线程兜底;
+    // CGEventSource 不可发送,信号线程自建一个。
+    let pressed = Arc::new(Mutex::new(PressedState::default()));
+    {
+        let pressed = Arc::clone(&pressed);
+        ctrlc::set_handler(move || {
+            let mut state = pressed.lock().unwrap();
+            if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+                release_all(&source, &mut state);
+            }
+            std::process::exit(0);
+        })
+        .expect("注册信号处理失败");
+    }
     loop {
-        match session(&args) {
+        match session(&args, Arc::clone(&pressed)) {
             Ok(()) => log!("对端关闭了连接"),
             Err(e) => log!("连接中断: {e}"),
         }
@@ -63,7 +83,7 @@ fn main() {
     }
 }
 
-fn session(args: &Args) -> io::Result<()> {
+fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     let mut stream = TcpStream::connect((args.host.as_str(), args.port))?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -75,7 +95,8 @@ fn session(args: &Args) -> io::Result<()> {
     )?;
     log!("已连接 {}:{}", args.host, args.port);
 
-    let mut injector = Injector::new(args.flip_scroll);
+    let mut injector = Injector::new(args.flip_scroll, pressed);
+    injector.reset_modifiers();
     loop {
         let frame = proto::read_frame(&mut stream)?;
         match frame {
@@ -89,25 +110,46 @@ fn session(args: &Args) -> io::Result<()> {
     }
 }
 
+/// 当前按住的键与按钮。纯数据,可跨线程发送——这是信号处理器
+/// 能兜底的结构前提。
+#[derive(Default)]
+struct PressedState {
+    keys: HashSet<u16>,
+    buttons: HashSet<MouseButton>,
+}
+
 struct Injector {
     source: CGEventSource,
-    pressed_keys: HashSet<u16>,
-    pressed_buttons: HashSet<MouseButton>,
+    pressed: Arc<Mutex<PressedState>>,
     flip_scroll: bool,
     /// 光标钳制在左缘期间的左推量时间窗,(时刻, 位移)。
-    edge_pushes: std::collections::VecDeque<(std::time::Instant, i32)>,
+    edge_pushes: VecDeque<(Instant, i32)>,
 }
 
 impl Injector {
-    fn new(flip_scroll: bool) -> Self {
+    fn new(flip_scroll: bool, pressed: Arc<Mutex<PressedState>>) -> Self {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .expect("无法创建 CGEventSource——请在 系统设置 → 隐私与安全性 → 辅助功能 中授权本程序");
         Self {
             source,
-            pressed_keys: HashSet::new(),
-            pressed_buttons: HashSet::new(),
+            pressed,
             flip_scroll,
-            edge_pushes: std::collections::VecDeque::new(),
+            edge_pushes: VecDeque::new(),
+        }
+    }
+
+    /// 系统级残留的按下状态(上个进程被 kill、历史 bug 等)不会随
+    /// 进程退出消失。每次建立会话时把所有修饰键抬一遍,治愈残留。
+    /// 注意不能抬 CapsLock:macOS 对合成 CapsLock 的 up 也会翻转锁定态。
+    fn reset_modifiers(&self) {
+        const MODIFIERS: [CGKeyCode; 8] = [
+            0x3B, 0x3E, // Control 左/右
+            0x38, 0x3C, // Shift 左/右
+            0x3A, 0x3D, // Option 左/右
+            0x37, 0x36, // Command 左/右
+        ];
+        for code in MODIFIERS {
+            post_key(&self.source, code, false, false);
         }
     }
 
@@ -125,51 +167,53 @@ impl Injector {
     }
 
     fn key(&mut self, usage: u16, state: KeyState) {
+        // macOS quirk:合成 CapsLock 事件在 down 和 up 时各翻转一次
+        // 锁定状态。只在按下时投递,松开/重复吞掉;且不入 pressed_keys,
+        // 否则 ReleaseAll 补发的 up 会在切回本地时多翻一次。
+        if usage == HID_CAPS_LOCK {
+            if state == KeyState::Press {
+                if let Some(code) = table::hid_to_mac(usage) {
+                    post_key(&self.source, code, true, false);
+                }
+            }
+            return;
+        }
         let Some(code) = table::hid_to_mac(usage) else {
             log!("未映射 HID usage,已忽略: {usage:#06x}");
             return;
         };
-        self.post_key(code, state != KeyState::Release, state == KeyState::Repeat);
+        post_key(
+            &self.source,
+            code,
+            state != KeyState::Release,
+            state == KeyState::Repeat,
+        );
+        let mut pressed = self.pressed.lock().unwrap();
         match state {
             KeyState::Press => {
-                self.pressed_keys.insert(usage);
+                pressed.keys.insert(usage);
             }
             KeyState::Release => {
-                self.pressed_keys.remove(&usage);
+                pressed.keys.remove(&usage);
             }
             KeyState::Repeat => {}
         }
     }
 
-    fn post_key(&self, code: CGKeyCode, down: bool, autorepeat: bool) {
-        let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), code, down) else {
-            log!("键盘事件创建失败: {code:#06x}");
-            return;
-        };
-        if autorepeat {
-            event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
-        }
-        event.post(CGEventTapLocation::HID);
-    }
-
     fn motion(&mut self, dx: i16, dy: i16) -> Option<Frame> {
-        let Some(mut p) = self.location() else {
-            return None;
-        };
+        let mut p = current_location(&self.source)?;
         // v0 只钳制在主屏;多屏支持在 roadmap。
         let b = CGDisplay::main().bounds();
         p.x = (p.x + f64::from(dx)).clamp(b.origin.x, b.origin.x + b.size.width - 1.0);
         p.y = (p.y + f64::from(dy)).clamp(b.origin.y, b.origin.y + b.size.height - 1.0);
 
         // 按住按钮时的移动必须发拖拽事件,否则 macOS 上无法拖选/拖放。
-        let event_type = self.pressed_buttons.iter().next().map_or(
-            CGEventType::MouseMoved,
-            |button| match button {
-                MouseButton::Left => CGEventType::LeftMouseDragged,
-                MouseButton::Right => CGEventType::RightMouseDragged,
-                MouseButton::Middle => CGEventType::OtherMouseDragged,
-            },
-        );
+        let held_button = self.pressed.lock().unwrap().buttons.iter().next().copied();
+        let event_type = held_button.map_or(CGEventType::MouseMoved, |button| match button {
+            MouseButton::Left => CGEventType::LeftMouseDragged,
+            MouseButton::Right => CGEventType::RightMouseDragged,
+            MouseButton::Middle => CGEventType::OtherMouseDragged,
+        });
         let Ok(event) =
             CGEvent::new_mouse_event(self.source.clone(), event_type, p, CGMouseButton::Left)
         else {
@@ -183,10 +227,10 @@ impl Injector {
         // 返程边缘检测:光标钳制在左缘、未按任何按钮时,
         // 左推量进时间窗;右移只是不进窗,不清零(容忍手抖)。
         // 光标一旦离开左缘(正常往里用),才清空窗口。
-        if p.x <= b.origin.x && self.pressed_buttons.is_empty() {
+        let pinned = p.x <= b.origin.x && held_button.is_none();
+        if pinned {
             if dx < 0 {
-                self.edge_pushes
-                    .push_back((std::time::Instant::now(), i32::from(-dx)));
+                self.edge_pushes.push_back((Instant::now(), i32::from(-dx)));
             }
             while self
                 .edge_pushes
@@ -208,38 +252,14 @@ impl Injector {
     }
 
     fn button(&mut self, button: MouseButton, state: ButtonState) {
-        let Some(p) = self.location() else { return };
-        let (event_type, cg_button) = match (button, state) {
-            (MouseButton::Left, ButtonState::Press) => {
-                (CGEventType::LeftMouseDown, CGMouseButton::Left)
-            }
-            (MouseButton::Left, ButtonState::Release) => {
-                (CGEventType::LeftMouseUp, CGMouseButton::Left)
-            }
-            (MouseButton::Right, ButtonState::Press) => {
-                (CGEventType::RightMouseDown, CGMouseButton::Right)
-            }
-            (MouseButton::Right, ButtonState::Release) => {
-                (CGEventType::RightMouseUp, CGMouseButton::Right)
-            }
-            (MouseButton::Middle, ButtonState::Press) => {
-                (CGEventType::OtherMouseDown, CGMouseButton::Center)
-            }
-            (MouseButton::Middle, ButtonState::Release) => {
-                (CGEventType::OtherMouseUp, CGMouseButton::Center)
-            }
-        };
-        let Ok(event) = CGEvent::new_mouse_event(self.source.clone(), event_type, p, cg_button)
-        else {
-            return;
-        };
-        event.post(CGEventTapLocation::HID);
+        post_button(&self.source, button, state);
+        let mut pressed = self.pressed.lock().unwrap();
         match state {
             ButtonState::Press => {
-                self.pressed_buttons.insert(button);
+                pressed.buttons.insert(button);
             }
             ButtonState::Release => {
-                self.pressed_buttons.remove(&button);
+                pressed.buttons.remove(&button);
             }
         }
     }
@@ -270,23 +290,8 @@ impl Injector {
         event.post(CGEventTapLocation::HID);
     }
 
-    /// 释放所有按住的键和按钮。切回本地/断线前由对端发 ReleaseAll 触发,
-    /// 进程退出时由 Drop 兜底。
     fn release_all(&mut self) {
-        let keys: Vec<u16> = self.pressed_keys.drain().collect();
-        for usage in keys {
-            if let Some(code) = table::hid_to_mac(usage) {
-                self.post_key(code, false, false);
-            }
-        }
-        let buttons: Vec<MouseButton> = self.pressed_buttons.drain().collect();
-        for button in buttons {
-            self.button(button, ButtonState::Release);
-        }
-    }
-
-    fn location(&self) -> Option<CGPoint> {
-        CGEvent::new(self.source.clone()).ok().map(|e| e.location())
+        release_all(&self.source, &mut self.pressed.lock().unwrap());
     }
 }
 
@@ -294,6 +299,65 @@ impl Drop for Injector {
     fn drop(&mut self) {
         self.release_all();
     }
+}
+
+/// 释放所有按住的键和按钮。自由函数形态,供正常路径(Injector)
+/// 和信号路径(自建 source)共用。
+fn release_all(source: &CGEventSource, pressed: &mut PressedState) {
+    for usage in pressed.keys.drain() {
+        if let Some(code) = table::hid_to_mac(usage) {
+            post_key(source, code, false, false);
+        }
+    }
+    let buttons: Vec<MouseButton> = pressed.buttons.drain().collect();
+    for button in buttons {
+        post_button(source, button, ButtonState::Release);
+    }
+}
+
+fn post_key(source: &CGEventSource, code: CGKeyCode, down: bool, autorepeat: bool) {
+    let Ok(event) = CGEvent::new_keyboard_event(source.clone(), code, down) else {
+        log!("键盘事件创建失败: {code:#06x}");
+        return;
+    };
+    if autorepeat {
+        event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
+    }
+    event.post(CGEventTapLocation::HID);
+}
+
+fn post_button(source: &CGEventSource, button: MouseButton, state: ButtonState) {
+    let Some(p) = current_location(source) else {
+        return;
+    };
+    let (event_type, cg_button) = match (button, state) {
+        (MouseButton::Left, ButtonState::Press) => {
+            (CGEventType::LeftMouseDown, CGMouseButton::Left)
+        }
+        (MouseButton::Left, ButtonState::Release) => {
+            (CGEventType::LeftMouseUp, CGMouseButton::Left)
+        }
+        (MouseButton::Right, ButtonState::Press) => {
+            (CGEventType::RightMouseDown, CGMouseButton::Right)
+        }
+        (MouseButton::Right, ButtonState::Release) => {
+            (CGEventType::RightMouseUp, CGMouseButton::Right)
+        }
+        (MouseButton::Middle, ButtonState::Press) => {
+            (CGEventType::OtherMouseDown, CGMouseButton::Center)
+        }
+        (MouseButton::Middle, ButtonState::Release) => {
+            (CGEventType::OtherMouseUp, CGMouseButton::Center)
+        }
+    };
+    let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, p, cg_button) else {
+        return;
+    };
+    event.post(CGEventTapLocation::HID);
+}
+
+fn current_location(source: &CGEventSource) -> Option<CGPoint> {
+    CGEvent::new(source.clone()).ok().map(|e| e.location())
 }
 
 struct Args {
