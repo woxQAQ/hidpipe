@@ -1,0 +1,13 @@
+[package]
+name = "hidpipe-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+evdev = "0.12"
+# 仅用于把设备 fd 设为非阻塞(fcntl O_NONBLOCK),evdev 0.12 未暴露此能力。
+# 与 evdev 0.12 对齐锁在 0.23:新版 nix 的 fcntl 改收 AsFd,
+# 而 evdev 0.12 的 Device 只实现了 AsRawFd。
+nix = "0.23"
+hidpipe-proto = { path = "../proto" }
