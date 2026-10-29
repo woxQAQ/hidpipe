@@ -3,7 +3,7 @@
 //! Responsibilities:
 //! 1. Read raw input from evdev. The preferred keyboard source is the keyd
 //!    virtual device, the definitive source after local remapping.
-//! 2. Toggle local/remote mode with a hotkey. In remote mode, EVIOCGRAB
+//! 2. Enter remote mode at the screen edge. In remote mode, EVIOCGRAB
 //!    grabs keyboard and mouse, and events are translated into HID usage ID
 //!    frames for the macOS injector.
 //! 3. Ungrab on disconnect. Grab state is released when the connection dies,
@@ -56,6 +56,8 @@ impl DeviceKind {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    let (barrier_tx, barrier_rx) = mpsc::channel::<BarrierEvent>();
+    barrier::spawn(barrier_tx)?;
     let (kbd, kbd_path) = open_device(DeviceKind::Keyboard, args.keyboard.as_deref())?;
     let (mouse, mouse_path) = open_device(DeviceKind::Mouse, args.mouse.as_deref())?;
     log!(
@@ -68,18 +70,14 @@ fn main() -> io::Result<()> {
         mouse.name().unwrap_or("?"),
         mouse_path.display()
     );
-    log!("switch key: {:?} | port: {}", args.switch_key, args.port);
     set_nonblocking(&kbd)?;
     set_nonblocking(&mouse)?;
 
     let listener = TcpListener::bind((args.bind.as_str(), args.port))?;
     listener.set_nonblocking(true)?;
+    log!("listening on {}:{}", args.bind, args.port);
 
     let (net_tx, net_rx) = mpsc::channel::<NetMsg>();
-    let (barrier_tx, barrier_rx) = mpsc::channel::<BarrierEvent>();
-    if !args.no_barrier {
-        barrier::spawn(barrier_tx);
-    }
     let mut app = App {
         kbd,
         mouse,
@@ -90,8 +88,6 @@ fn main() -> io::Result<()> {
         motion: (0, 0),
         wheel: (0, 0),
         armed: true,
-        switch_key: args.switch_key,
-        probe: args.probe,
         swap_caps_esc: args.swap_caps_esc,
         listener,
         net_tx,
@@ -123,8 +119,6 @@ struct App {
     /// Relative motion accumulated between SYN_REPORTs.
     motion: (i64, i64),
     wheel: (i64, i64),
-    switch_key: Key,
-    probe: bool,
     swap_caps_esc: bool,
     listener: TcpListener,
     net_tx: mpsc::Sender<NetMsg>,
@@ -198,7 +192,7 @@ impl App {
                 BarrierEvent::Enter => {
                     if self.armed && self.mode == Mode::Local {
                         self.armed = false;
-                        self.toggle_mode();
+                        self.enter_remote();
                     }
                 }
                 BarrierEvent::Leave => self.armed = true,
@@ -248,21 +242,6 @@ impl App {
 
     /// value: 0 = release, 1 = press, 2 = hold repeat.
     fn on_key(&mut self, key: Key, value: i32) {
-        if self.probe {
-            // Probe mode only reports key names; no switching or forwarding.
-            if value == 1 {
-                log!("pressed: {key:?}");
-            }
-            return;
-        }
-        if key == self.switch_key {
-            if value == 1 {
-                self.toggle_mode();
-            }
-            // The switch key itself is never forwarded; it belongs to the
-            // local control plane, not the data plane.
-            return;
-        }
         if self.mode != Mode::Remote {
             return;
         }
@@ -341,29 +320,18 @@ impl App {
         }
     }
 
-    fn toggle_mode(&mut self) {
-        match self.mode {
-            Mode::Local => {
-                if self.conn.is_none() {
-                    log!("no client connected, staying local");
-                    return;
-                }
-                if let Err(e) = self.kbd.grab().and_then(|()| self.mouse.grab()) {
-                    log!("grab failed, staying local: {e}");
-                    self.ungrab_all();
-                    return;
-                }
-                self.mode = Mode::Remote;
-                log!("-> remote mode: input goes to macOS");
-            }
-            Mode::Remote => {
-                // Tell the peer to release all keys before ungrabbing;
-                // the order matters.
-                self.send(Frame::ReleaseAll);
-                self.leave_remote();
-                log!("-> local mode");
-            }
+    fn enter_remote(&mut self) {
+        if self.conn.is_none() {
+            log!("no client connected, staying local");
+            return;
         }
+        if let Err(e) = self.kbd.grab().and_then(|()| self.mouse.grab()) {
+            log!("grab failed, staying local: {e}");
+            self.ungrab_all();
+            return;
+        }
+        self.mode = Mode::Remote;
+        log!("-> remote mode: input goes to macOS");
     }
 
     fn leave_remote(&mut self) {

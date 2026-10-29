@@ -8,6 +8,7 @@
 
 use std::error::Error;
 use std::fs::File;
+use std::io;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -27,13 +28,15 @@ pub enum BarrierEvent {
     Leave,
 }
 
-/// Start the barrier thread. Without a Wayland session it exits quietly
-/// and switching falls back to hotkey only. Reconnects automatically on
-/// disconnect, so a compositor restart does not take down the input pipe.
-pub fn spawn(tx: Sender<BarrierEvent>) {
+/// Start the barrier thread. A Wayland session is required for edge
+/// switching. Reconnects automatically on disconnect, so a compositor
+/// restart does not take down the input pipe.
+pub fn spawn(tx: Sender<BarrierEvent>) -> io::Result<()> {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        log!("(barrier) no WAYLAND_DISPLAY, edge switching unavailable, hotkey only");
-        return;
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "WAYLAND_DISPLAY is not set; edge switching requires a Wayland session",
+        ));
     }
     thread::spawn(move || loop {
         if let Err(e) = run(tx.clone()) {
@@ -41,6 +44,7 @@ pub fn spawn(tx: Sender<BarrierEvent>) {
         }
         thread::sleep(Duration::from_secs(5));
     });
+    Ok(())
 }
 
 fn run(tx: Sender<BarrierEvent>) -> Result<(), Box<dyn Error>> {
