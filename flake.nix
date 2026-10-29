@@ -26,6 +26,9 @@
               clippy
               rust-analyzer
             ];
+            # darwin 上 Rust 链接期需要 -liconv;放进 buildInputs
+            # 让 stdenv 的 NIX_LDFLAGS 带上它的库路径。
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
           };
         }
       );
