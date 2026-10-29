@@ -5,10 +5,16 @@
 //! 不会作用于远端按键(不会双重映射),远端按键也不依赖本地规则
 //! (不会时灵时不灵)。换键责任全部在捕获侧,恰好一次。
 //!
+//! 修饰键纪律(macOS 注入的核心坑):
+//! 合成事件默认继承 event source 的 flags,而系统按事件自带的
+//! flags 更新修饰键状态——只投 down/up 不控制 flags,状态必然错乱
+//! (症状:所有按键带 ⌃、左键变 ctrl+click 弹右键菜单)。
+//! 因此我们自维护修饰键位掩码,给每个事件显式 set_flags。
+//!
 //! 防卡键的三道防线:
-//! 1. 会话建立时 reset_modifiers 抬一遍所有修饰键,治愈历史残留;
-//! 2. 断线时 Injector Drop 释放本会话按住的键;
-//! 3. SIGTERM/SIGINT 经共享的 PressedState 由信号线程兜底释放。
+//! 1. 断线时 Injector Drop 释放本会话按住的键;
+//! 2. SIGTERM/SIGINT 经共享的 PressedState 由信号线程兜底释放;
+//! 3. 每个事件 flags 显式可控,系统级历史残留影响不到我们的事件。
 
 #![forbid(unsafe_code)]
 
@@ -23,7 +29,8 @@ use std::time::{Duration, Instant};
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField, ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
+    ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -96,7 +103,6 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     log!("已连接 {}:{}", args.host, args.port);
 
     let mut injector = Injector::new(args.flip_scroll, pressed);
-    injector.reset_modifiers();
     loop {
         let frame = proto::read_frame(&mut stream)?;
         match frame {
@@ -110,18 +116,23 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     }
 }
 
-/// 当前按住的键与按钮。纯数据,可跨线程发送——这是信号处理器
-/// 能兜底的结构前提。
+/// 当前按住的键、按钮与修饰键位掩码。纯数据,可跨线程发送——
+/// 这是信号处理器能兜底的结构前提。
 #[derive(Default)]
 struct PressedState {
     keys: HashSet<u16>,
     buttons: HashSet<MouseButton>,
+    mods: CGEventFlags,
 }
 
 struct Injector {
     source: CGEventSource,
     pressed: Arc<Mutex<PressedState>>,
     flip_scroll: bool,
+    /// 自跟踪的光标位置。每个 motion 都查系统位置等于每帧一次
+    /// WindowServer 往返,125Hz 下可观;会话内只有我们在动光标,
+    /// 自跟踪即可。会话开始时的初始值从系统读一次。
+    cursor: CGPoint,
     /// 光标钳制在左缘期间的左推量时间窗,(时刻, 位移)。
     edge_pushes: VecDeque<(Instant, i32)>,
 }
@@ -130,29 +141,19 @@ impl Injector {
     fn new(flip_scroll: bool, pressed: Arc<Mutex<PressedState>>) -> Self {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .expect("无法创建 CGEventSource——请在 系统设置 → 隐私与安全性 → 辅助功能 中授权本程序");
+        let cursor = current_location(&source).unwrap_or_else(|| {
+            let b = CGDisplay::main().bounds();
+            CGPoint::new(
+                b.origin.x + b.size.width / 2.0,
+                b.origin.y + b.size.height / 2.0,
+            )
+        });
         Self {
             source,
             pressed,
             flip_scroll,
+            cursor,
             edge_pushes: VecDeque::new(),
-        }
-    }
-
-    /// 系统级残留的按下状态(上个进程被 kill、历史 bug 等)不会随
-    /// 进程退出消失。每次建立会话时把所有修饰键抬一遍,治愈残留。
-    /// 注意不能抬 CapsLock:macOS 对合成 CapsLock 的 up 也会翻转锁定态。
-    fn reset_modifiers(&self) {
-        const MODIFIERS: [CGKeyCode; 8] = [
-            0x3B, 0x3E, // Control 左/右
-            0x38, 0x3C, // Shift 左/右
-            0x3A, 0x3D, // Option 左/右
-            0x37, 0x36, // Command 左/右
-        ];
-        for code in MODIFIERS {
-            // 成对投递:系统对无匹配的孤立 up 可能直接忽略;
-            // down+up 无论之前处于什么状态,都以释放收场。
-            post_key(&self.source, code, true, false);
-            post_key(&self.source, code, false, false);
         }
     }
 
@@ -170,14 +171,16 @@ impl Injector {
     }
 
     fn key(&mut self, usage: u16, state: KeyState) {
-        // macOS quirk:合成 CapsLock 事件在 down 和 up 时各翻转一次
-        // 锁定状态。只在按下时投递,松开/重复吞掉;且不入 pressed_keys,
-        // 否则 ReleaseAll 补发的 up 会在切回本地时多翻一次。
+        // CapsLock 是锁定型修饰键:不发按键事件,只翻转 AlphaShift 标志,
+        // 由后续事件携带。macOS 对合成 CapsLock 的 down/up 各翻转一次
+        // 锁定态,携带标志位才能得到恰好一次的大小写切换。
         if usage == HID_CAPS_LOCK {
             if state == KeyState::Press {
-                if let Some(code) = table::hid_to_mac(usage) {
-                    post_key(&self.source, code, true, false);
-                }
+                self.pressed
+                    .lock()
+                    .unwrap()
+                    .mods
+                    .toggle(CGEventFlags::CGEventFlagAlphaShift);
             }
             return;
         }
@@ -185,13 +188,22 @@ impl Injector {
             log!("未映射 HID usage,已忽略: {usage:#06x}");
             return;
         };
+        let mut pressed = self.pressed.lock().unwrap();
+        // 先更新修饰键位掩码,再让事件带上"事件发生后的"flags——
+        // 修饰键按下事件的 flags 含它自己,松开事件的 flags 不含。
+        if let Some(flag) = modifier_flag(usage) {
+            match state {
+                KeyState::Press | KeyState::Repeat => pressed.mods.insert(flag),
+                KeyState::Release => pressed.mods.remove(flag),
+            }
+        }
         post_key(
             &self.source,
             code,
             state != KeyState::Release,
             state == KeyState::Repeat,
+            pressed.mods,
         );
-        let mut pressed = self.pressed.lock().unwrap();
         match state {
             KeyState::Press => {
                 pressed.keys.insert(usage);
@@ -204,33 +216,41 @@ impl Injector {
     }
 
     fn motion(&mut self, dx: i16, dy: i16) -> Option<Frame> {
-        let mut p = current_location(&self.source)?;
         // v0 只钳制在主屏;多屏支持在 roadmap。
         let b = CGDisplay::main().bounds();
-        p.x = (p.x + f64::from(dx)).clamp(b.origin.x, b.origin.x + b.size.width - 1.0);
-        p.y = (p.y + f64::from(dy)).clamp(b.origin.y, b.origin.y + b.size.height - 1.0);
+        self.cursor.x =
+            (self.cursor.x + f64::from(dx)).clamp(b.origin.x, b.origin.x + b.size.width - 1.0);
+        self.cursor.y =
+            (self.cursor.y + f64::from(dy)).clamp(b.origin.y, b.origin.y + b.size.height - 1.0);
 
+        let (held_button, mods) = {
+            let pressed = self.pressed.lock().unwrap();
+            (pressed.buttons.iter().next().copied(), pressed.mods)
+        };
         // 按住按钮时的移动必须发拖拽事件,否则 macOS 上无法拖选/拖放。
-        let held_button = self.pressed.lock().unwrap().buttons.iter().next().copied();
         let event_type = held_button.map_or(CGEventType::MouseMoved, |button| match button {
             MouseButton::Left => CGEventType::LeftMouseDragged,
             MouseButton::Right => CGEventType::RightMouseDragged,
             MouseButton::Middle => CGEventType::OtherMouseDragged,
         });
-        let Ok(event) =
-            CGEvent::new_mouse_event(self.source.clone(), event_type, p, CGMouseButton::Left)
-        else {
+        let Ok(event) = CGEvent::new_mouse_event(
+            self.source.clone(),
+            event_type,
+            self.cursor,
+            CGMouseButton::Left,
+        ) else {
             return None;
         };
         // 游戏等读相对位移的场景看 delta 字段,而非绝对位置。
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+        event.set_flags(mods);
         event.post(CGEventTapLocation::HID);
 
         // 返程边缘检测:光标钳制在左缘、未按任何按钮时,
         // 左推量进时间窗;右移只是不进窗,不清零(容忍手抖)。
         // 光标一旦离开左缘(正常往里用),才清空窗口。
-        let pinned = p.x <= b.origin.x && held_button.is_none();
+        let pinned = self.cursor.x <= b.origin.x && held_button.is_none();
         if pinned {
             if dx < 0 {
                 self.edge_pushes.push_back((Instant::now(), i32::from(-dx)));
@@ -255,8 +275,8 @@ impl Injector {
     }
 
     fn button(&mut self, button: MouseButton, state: ButtonState) {
-        post_button(&self.source, button, state);
         let mut pressed = self.pressed.lock().unwrap();
+        post_button(&self.source, button, state, self.cursor, pressed.mods);
         match state {
             ButtonState::Press => {
                 pressed.buttons.insert(button);
@@ -290,6 +310,7 @@ impl Injector {
         ) else {
             return;
         };
+        event.set_flags(self.pressed.lock().unwrap().mods);
         event.post(CGEventTapLocation::HID);
     }
 
@@ -308,31 +329,65 @@ impl Drop for Injector {
 /// 和信号路径(自建 source)共用。
 fn release_all(source: &CGEventSource, pressed: &mut PressedState) {
     for usage in pressed.keys.drain() {
+        if let Some(flag) = modifier_flag(usage) {
+            pressed.mods.remove(flag);
+        }
         if let Some(code) = table::hid_to_mac(usage) {
-            post_key(source, code, false, false);
+            post_key(source, code, false, false, pressed.mods);
         }
     }
+    pressed.mods = CGEventFlags::empty();
     let buttons: Vec<MouseButton> = pressed.buttons.drain().collect();
     for button in buttons {
-        post_button(source, button, ButtonState::Release);
+        if let Some(p) = current_location(source) {
+            post_button(source, button, ButtonState::Release, p, pressed.mods);
+        }
     }
 }
 
-fn post_key(source: &CGEventSource, code: CGKeyCode, down: bool, autorepeat: bool) {
+/// 修饰键 usage → CGEventFlags。CapsLock(0x39)不在此列,
+/// 它是锁定型,走 AlphaShift 翻转路径。
+fn modifier_flag(usage: u16) -> Option<CGEventFlags> {
+    Some(match usage {
+        0xE0 | 0xE4 => CGEventFlags::CGEventFlagControl,
+        0xE1 | 0xE5 => CGEventFlags::CGEventFlagShift,
+        0xE2 | 0xE6 => CGEventFlags::CGEventFlagAlternate,
+        0xE3 | 0xE7 => CGEventFlags::CGEventFlagCommand,
+        _ => return None,
+    })
+}
+
+fn post_key(
+    source: &CGEventSource,
+    code: CGKeyCode,
+    down: bool,
+    autorepeat: bool,
+    flags: CGEventFlags,
+) {
     let Ok(event) = CGEvent::new_keyboard_event(source.clone(), code, down) else {
         log!("键盘事件创建失败: {code:#06x}");
         return;
     };
+    let mut flags = flags;
+    // 硬件方向键带 NumericPad|SecondaryFn;CGEventTap 类热键工具
+    // (平铺窗口管理器等)靠这两个标志识别导航键。
+    if (0x7B..=0x7E).contains(&code) {
+        flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
+    }
+    event.set_flags(flags);
     if autorepeat {
         event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
     }
     event.post(CGEventTapLocation::HID);
 }
 
-fn post_button(source: &CGEventSource, button: MouseButton, state: ButtonState) {
-    let Some(p) = current_location(source) else {
-        return;
-    };
+fn post_button(
+    source: &CGEventSource,
+    button: MouseButton,
+    state: ButtonState,
+    position: CGPoint,
+    flags: CGEventFlags,
+) {
     let (event_type, cg_button) = match (button, state) {
         (MouseButton::Left, ButtonState::Press) => {
             (CGEventType::LeftMouseDown, CGMouseButton::Left)
@@ -353,9 +408,11 @@ fn post_button(source: &CGEventSource, button: MouseButton, state: ButtonState) 
             (CGEventType::OtherMouseUp, CGMouseButton::Center)
         }
     };
-    let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, p, cg_button) else {
+    let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, position, cg_button)
+    else {
         return;
     };
+    event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
 }
 
