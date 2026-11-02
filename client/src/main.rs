@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
-    ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
+    CGScrollEventUnit, EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -408,7 +408,7 @@ impl Injector {
         self.scroll_units(ScrollEventUnit::LINE, wheel_count, w1, w2, w3);
     }
 
-    fn scroll_units(&self, units: ScrollEventUnit, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
+    fn scroll_units(&self, units: CGScrollEventUnit, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
         let Ok(event) =
             CGEvent::new_scroll_event(self.source.clone(), units, wheel_count, w1, w2, w3)
         else {
