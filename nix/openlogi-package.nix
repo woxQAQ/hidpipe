@@ -14,6 +14,7 @@ openlogi.overrideAttrs (
       ./openlogi-config-symlink.patch
       ./openlogi-pointer-capture.patch
       ./openlogi-bridge.patch
+      ./openlogi-wheel.patch
     ];
     postPatch =
       (old.postPatch or "")

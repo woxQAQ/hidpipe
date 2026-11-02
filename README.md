@@ -246,13 +246,26 @@ substring selecting exactly one physical Logitech mouse). Pass
 `--openlogi-socket <path>` to hidpipe on each machine. The agent's socket is
 local-only and versioned independently of GUI IPC.
 
+The main wheel uses ordinary kernel ticks by default, reducing accidental
+scrolling from sub-notch motion on both Linux and the remote Mac. The thumb
+wheel keeps its existing resolution. To retain smooth high-resolution main-wheel
+input, set this option on the Linux capture machine:
+
+```nix
+services.hidpipe.openlogi.highResolutionScroll = true;
+```
+
+For manual operation, set `OPENLOGI_BRIDGE_WHEEL_HIRES=1` on the Linux agent.
+The wheel policy takes effect when that agent starts.
+
 Capture is a connection-scoped lease with a 750 ms heartbeat deadline. A held
 mouse button prevents entry. Disconnect, a stalled server, input-hook failure,
 or a full capture queue revokes the lease and restores Linux routing. Buttons
 still held at revocation are quarantined until release; pending gestures are
 cancelled without firing a click. On macOS, binding lookup happens before normal
 mouse injection, and a held button keeps its original disposition across config
-or foreground-app changes. Sub-notch wheel motion is retained. Hardware settings
+or foreground-app changes. Sub-notch main-wheel motion is retained when
+high-resolution scrolling is enabled. Hardware settings
 such as DPI and SmartShift belong to the Linux profile; this bridge does not
 forward hardware actions from the Mac back to the physical device.
 

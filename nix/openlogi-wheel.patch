@@ -1,0 +1,103 @@
+diff --git a/crates/openlogi-hook/src/linux.rs b/crates/openlogi-hook/src/linux.rs
+--- a/crates/openlogi-hook/src/linux.rs
++++ b/crates/openlogi-hook/src/linux.rs
+@@ -84,6 +84,8 @@ pub(crate) fn start(
+         return Err(HookError::NoDeviceFound);
+     }
+ 
++    let discrete_wheel = std::env::var_os("OPENLOGI_BRIDGE_SOCKET").is_some()
++        && std::env::var_os("OPENLOGI_BRIDGE_WHEEL_HIRES").is_none_or(|value| value != "1");
+     let stop = Arc::new(AtomicBool::new(false));
+     let cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
+     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(devices.len());
+@@ -93,14 +95,22 @@ pub(crate) fn start(
+         for (path, mut device) in devices {
+             // Publish a hook only after every source is exclusively owned.
+             device.grab()?;
+-            let virtual_device = build_virtual_device(&device)?;
++            let virtual_device = build_virtual_device(&device, discrete_wheel)?;
+             let (rx, tx) = create_pipe()?;
+             let stop_clone = Arc::clone(&stop);
+             let cb_clone = Arc::clone(&cb);
+             let handle = thread::Builder::new()
+                 .name(format!("openlogi-hook:{}", path.display()))
+                 .spawn(move || {
+-                    device_thread(path, device, virtual_device, cb_clone, stop_clone, rx);
++                    device_thread(
++                        path,
++                        device,
++                        virtual_device,
++                        cb_clone,
++                        stop_clone,
++                        rx,
++                        discrete_wheel,
++                    );
+                 })?;
+             threads.push(handle);
+             stop_pipes.push(tx);
+@@ -263,7 +273,10 @@ fn is_hookable_mouse(
+     !touches && !props.contains(PropType::POINTING_STICK)
+ }
+ 
+-fn build_virtual_device(device: &Device) -> io::Result<evdev::uinput::VirtualDevice> {
++fn build_virtual_device(
++    device: &Device,
++    discrete_wheel: bool,
++) -> io::Result<evdev::uinput::VirtualDevice> {
+     let builder = VirtualDevice::builder()?
+         .name(VIRTUAL_DEVICE_NAME)
+         .input_id(device.input_id());
+@@ -275,7 +288,13 @@ fn build_virtual_device(device: &Device) -> io::Result<evdev::uinput::VirtualDev
+     };
+ 
+     let builder = if let Some(axes) = device.supported_relative_axes() {
+-        builder.with_relative_axes(axes)?
++        // Advertise the same vertical stream we deliver. libinput prefers the
++        // high-resolution axis when present, even if only coarse events arrive.
++        let axes: evdev::AttributeSet<_> = axes
++            .iter()
++            .filter(|axis| !discrete_wheel || *axis != RelativeAxisCode::REL_WHEEL_HI_RES)
++            .collect();
++        builder.with_relative_axes(&axes)?
+     } else {
+         builder
+     };
+@@ -424,6 +443,7 @@ fn device_thread(
+     cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
+     stop: Arc<AtomicBool>,
+     stop_rx: OwnedFd,
++    discrete_wheel: bool,
+ ) {
+     let hires_scroll = device
+         .supported_relative_axes()
+@@ -473,11 +493,28 @@ fn device_thread(
+                     pending.clear();
+                 }
+             } else {
+-                let disposition = match translate(&event, hires_scroll) {
++                // Use the kernel's ordinary vertical ticks in discrete mode.
++                // Filter before the callback so local and remote see one policy.
++                let vertical_wheel = matches!(
++                    event.destructure(),
++                    EventSummary::RelativeAxis(
++                        _,
++                        RelativeAxisCode::REL_WHEEL | RelativeAxisCode::REL_WHEEL_HI_RES,
++                        _
++                    )
++                );
++                if discrete_wheel
++                    && vertical_wheel
++                    && event.code() == RelativeAxisCode::REL_WHEEL_HI_RES.0
++                {
++                    continue;
++                }
++                let event_hires = hires_scroll && !(discrete_wheel && vertical_wheel);
++                let disposition = match translate(&event, event_hires) {
+                     Some(me) => cb(HookEvent::Mouse(me)),
+                     // Low-res companions (REL_WHEEL/REL_HWHEEL) must be suppressed when hi-res
+                     // is active — passing them through would double the scroll distance.
+-                    None if hires_scroll
++                    None if event_hires
+                         && matches!(
+                             event.destructure(),
+                             EventSummary::RelativeAxis(

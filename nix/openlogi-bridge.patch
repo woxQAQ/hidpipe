@@ -54,7 +54,7 @@ new file mode 100644
 index 00000000..bfeb2ef0
 --- /dev/null
 +++ b/crates/openlogi-agent-core/src/remote.rs
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,500 @@
 +//! Opt-in local pointer routing for hidpipe. The GUI IPC remains independent.
 +//!
 +//! One capture lease routes the configured Linux mouse before binding lookup.
@@ -425,8 +425,10 @@ index 00000000..bfeb2ef0
 +    }
 +
 +    fn local(&self, event: PointerEvent) {
-+        let (Ok(mut engine), Ok(profile)) = (self.local_engine.try_lock(), self.profile.try_read())
-+        else {
++        // This runs on the HID++ worker, outside the OS input hook. Preserve
++        // every control transition across profile publication; dropping a
++        // release would leave the engine ignoring subsequent presses.
++        let (Ok(mut engine), Ok(profile)) = (self.local_engine.lock(), self.profile.read()) else {
 +            return;
 +        };
 +        for effect in engine.process(event, &profile).effects {
@@ -514,6 +516,10 @@ index 00000000..bfeb2ef0
 +        CapturedInput::Interrupted => {
 +            bridge.hid_ready.store(false, Ordering::Release);
 +            bridge.capture_fault.store(true, Ordering::Release);
++            // A stopped HID++ session cannot deliver releases for its controls.
++            // Native buttons remain tracked by the independent OS hook.
++            bridge.down.fetch_and(0b0001_1111, Ordering::SeqCst);
++            bridge.quarantine.fetch_and(0b0001_1111, Ordering::AcqRel);
 +            bridge.local(PointerEvent::Reset);
 +            None
 +        }
@@ -804,7 +810,7 @@ new file mode 100644
 index 00000000..010ba97a
 --- /dev/null
 +++ b/crates/openlogi-agent-core/tests/remote_bridge.rs
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,257 @@
 +//! Exercise both roles of the actual agent without opening input devices or
 +//! injecting platform actions. The singleton bridge uses one integration test.
 +#![cfg(target_os = "linux")]
@@ -993,6 +999,50 @@ index 00000000..010ba97a
 +    drop(capture);
 +}
 +
++fn interrupted_controls_recover(socket: &Path) {
++    let motion = MouseEvent::Moved {
++        delta_x: 1,
++        delta_y: 0,
++    };
++    let deadline = Instant::now() + Duration::from_secs(2);
++    while remote::hook_input(&motion).is_some() {
++        assert!(Instant::now() < deadline, "capture cleanup must finish");
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    assert!(
++        remote::hook_input(&MouseEvent::Button {
++            id: ButtonId::LeftClick,
++            pressed: true,
++            device: None,
++        })
++        .is_none()
++    );
++    assert!(remote::captured(
++        "mouse",
++        CapturedInput::RawButton {
++            button: ButtonId::GestureButton,
++            pressed: true,
++        },
++    ));
++    assert!(remote::captured("mouse", CapturedInput::Interrupted));
++    assert!(remote::captured("mouse", CapturedInput::Ready));
++    let (_, ack) = connect(socket, 0);
++    assert_eq!(ack, 1, "HID++ interruption must retain native button holds");
++    assert!(
++        remote::hook_input(&MouseEvent::Button {
++            id: ButtonId::LeftClick,
++            pressed: false,
++            device: None,
++        })
++        .is_none()
++    );
++    let (_capture, ack) = connect(socket, 0);
++    assert_eq!(
++        ack, 0,
++        "re-armed HID++ controls must forget interrupted holds"
++    );
++}
++
 +#[test]
 +fn local_socket_routes_before_bindings_and_cleans_up_leases() {
 +    let directory =
@@ -1015,6 +1065,7 @@ index 00000000..010ba97a
 +    destination_profile(&socket, &mut config);
 +    #[cfg(target_os = "linux")]
 +    capture_recovery(&socket, capture_records(&socket));
++    interrupted_controls_recover(&socket);
 +    std::fs::remove_dir_all(directory).unwrap();
 +}
 diff --git a/crates/openlogi-agent/src/launch_agent.rs b/crates/openlogi-agent/src/launch_agent.rs
