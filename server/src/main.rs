@@ -106,7 +106,7 @@ fn main() -> io::Result<()> {
         app.accept_pending();
         app.handle_net_msgs();
         app.drain_barrier();
-        app.drain_keyboard();
+        app.drain_keyboard()?;
         app.drain_mouse();
         sleep(Duration::from_millis(1));
     }
@@ -214,17 +214,16 @@ impl App {
         }
     }
 
-    fn drain_keyboard(&mut self) {
+    fn drain_keyboard(&mut self) -> io::Result<()> {
         let events = match fetch_all(&mut self.kbd) {
             Ok(events) => events,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => {
-                // Hard errors such as an unplugged device: fall back to local
-                // mode and wait for manual intervention, better than silently
-                // losing input.
-                log!("keyboard read failed ({e}), back to local mode");
+                // The supervisor reopens the device after keyd restarts or the
+                // keyboard disappears. Release remote input before exiting.
+                log!("keyboard read failed ({e}), releasing input and exiting");
                 self.leave_remote();
-                return;
+                return Err(e);
             }
         };
         for event in events {
@@ -232,6 +231,7 @@ impl App {
                 self.on_key(key, event.value());
             }
         }
+        Ok(())
     }
 
     fn drain_mouse(&mut self) {

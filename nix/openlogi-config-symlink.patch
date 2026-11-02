@@ -1,0 +1,21 @@
+diff --git a/crates/openlogi-core/src/config.rs b/crates/openlogi-core/src/config.rs
+index e810c218..643ca7ce 100644
+--- a/crates/openlogi-core/src/config.rs
++++ b/crates/openlogi-core/src/config.rs
+@@ -218,6 +218,16 @@ impl Config {
+ 
+     /// Same as [`Self::save_atomic`] but writes to `path`. Used by tests.
+     pub fn save_to_path(&self, path: &Path) -> Result<(), ConfigError> {
++        // Preserve links to externally managed, writable configuration files.
++        let target = path
++            .is_symlink()
++            .then(|| fs::canonicalize(path))
++            .transpose()
++            .map_err(|source| ConfigError::Write {
++                path: path.to_path_buf(),
++                source,
++            })?;
++        let path = target.as_deref().unwrap_or(path);
+         if let Some(parent) = path.parent() {
+             fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+                 path: path.to_path_buf(),

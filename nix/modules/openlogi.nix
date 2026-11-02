@@ -7,6 +7,16 @@
 {
   options = {
     enable = lib.mkEnableOption "OpenLogi pointer routing with destination-side bindings";
+    gui.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Build and install the OpenLogi GUI alongside the CLI and agent.
+        This preserves the desktop launcher on Linux and the application bundle
+        on macOS. Disable for an agent-only installation; this does not start
+        a GUI automatically.
+      '';
+    };
     basePackage = lib.mkOption {
       type = lib.types.package;
       default = pkgs.openlogi;
@@ -14,8 +24,11 @@
     };
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.callPackage ../openlogi-package.nix { openlogi = cfg.openlogi.basePackage; };
-      description = "OpenLogi with the hidpipe bridge patch, including its GUI and agent.";
+      default = pkgs.callPackage ../openlogi-package.nix {
+        openlogi = cfg.openlogi.basePackage;
+        withGui = cfg.openlogi.gui.enable;
+      };
+      description = "OpenLogi with the hidpipe bridge patches. GUI inclusion follows openlogi.gui.enable.";
     };
     socket = lib.mkOption {
       type = lib.types.str;

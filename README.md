@@ -104,7 +104,9 @@ Accessibility; the terminal's permission does not cover the agent. Use
 Cmd+Shift+G in the file picker to select `~/.nix-profile/bin/hidpipe-client`
 (or the `bin/hidpipe-client` under your Home Manager profile). A package upgrade
 changes the executable's Nix store path and may require granting access again.
-Logs go to `~/Library/Logs/hidpipe.log`.
+Logs go to `~/Library/Logs/hidpipe.log`. The client requests event-posting
+permission before connecting and waits until access is granted. Revoking access
+closes the connection on the next heartbeat, releasing Linux input.
 
 Home Manager also supports the Linux server, using the same server options as
 the NixOS module:
@@ -174,6 +176,7 @@ services.hidpipe = {
   openlogi = {
     enable = true;
     mouse = "MX Master 2S";
+    gui.enable = true; # default; retain the OpenLogi settings UI
     # device = "<OpenLogi config key>"; # required for multiple configured mice
   };
 };
@@ -183,7 +186,27 @@ Disable logiops and other services that capture or divert the same mouse. The
 module provides the patched OpenLogi GUI and agent, grants the user `input` and
 `uinput` membership, and enables `/dev/uinput`. Log out and back in after changing
 groups. OpenLogi owns the physical mouse for the entire session; hidpipe only grabs
-the keyd keyboard when entering remote mode.
+the keyd keyboard when entering remote mode. If keyd's wildcard identifies the
+mouse as a keyboard, exclude its vendor/product ID. For the MX Master 2S:
+
+```nix
+services.keyd.keyboards.default.ids = [ "*" "-046d:4069" ];
+```
+
+OpenLogi preserves that ID on its virtual mouse, so the exclusion covers both.
+The NixOS module also reapplies udev permissions to already-connected Logitech
+HID devices when its rules change.
+
+`services.hidpipe.openlogi.gui.enable` defaults to `true`. This builds and installs
+the Linux desktop launcher or macOS application bundle alongside the agent, and
+leaves GUI startup to the user. Set it to `false` for a CLI and agent installation.
+The package function exposes the same choice as `withGui`:
+
+```nix
+inputs.hidpipe.packages.${pkgs.stdenv.hostPlatform.system}.openlogi.override {
+  withGui = false;
+}
+```
 
 On macOS with Home Manager:
 
@@ -206,6 +229,8 @@ migrating to the managed service, and remove its old login item. Grant the patch
 `openlogi-agent` and `hidpipe-client` Accessibility access on macOS.
 
 The module manages `openlogi-agent.service` on Linux and a launchd agent on macOS.
+The bridged package owns the capture-readiness, virtual-device identity and
+mutable-config fixes; consumers do not need to apply additional OpenLogi patches.
 Logs on the Mac are in `~/Library/Logs/openlogi-agent.log`. Socket paths default to
 `~/.cache/openlogi-hidpipe/pointer.sock` and must be in a private directory (0700).
 The agent uses `OPENLOGI_MANAGED_SERVICE=1` to leave autostart management to Nix.
@@ -251,7 +276,7 @@ macOS:
 hidpipe-client <linux-ip>         # retries once a second until connected
 ```
 
-On first run, grant the terminal (iTerm, Terminal, etc.) access in System Settings > Privacy & Security > Accessibility.
+On first run, grant Accessibility access to the executable. A launchd service needs its own permission; the terminal's permission does not cover it. Until event-posting access is granted, the client waits without connecting to Linux.
 
 Switching works like this. Push the cursor past the right edge of the Linux screen to enter remote mode; the trigger is a layer-shell barrier, so the compositor itself detects the crossing. On the Mac, push the cursor against the left edge and keep pushing to hand control back. In remote mode the Linux cursor freezes because the devices are grabbed, and all input goes to the Mac.
 
@@ -276,7 +301,7 @@ Switching works like this. Push the cursor past the right edge of the Linux scre
 - The mouse is clamped to the main display. Multi-monitor support is on the roadmap.
 - The barrier sits on the right edge of every output. With multiple monitors, the seam between two outputs triggers it too. Per-output configuration is on the roadmap.
 - The return direction (Mac to Linux) only watches the left edge of the Mac's main display.
-- Hot-plug is not handled. A failed read falls back to local mode and logs; restart the server to recover.
+- Keyboard device loss (including a keyd restart) releases remote input and exits. The systemd service restarts the server and opens the current device. A directly captured evdev mouse requires a server restart after hot-plug.
 - Side mouse buttons (back, forward) are forwarded with the OpenLogi backend; native evdev capture still forwards three buttons.
 
 ## Roadmap

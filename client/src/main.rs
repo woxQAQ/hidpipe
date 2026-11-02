@@ -23,8 +23,10 @@
 //! 3. Every event's flags are explicitly controlled, so system-level
 //!    leftovers cannot affect our events.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+#[allow(unsafe_code)]
+mod event_access;
 mod table;
 
 use std::collections::{HashSet, VecDeque};
@@ -93,7 +95,26 @@ fn main() {
         })
         .expect("failed to install signal handler");
     }
+    let mut requested_access = false;
     loop {
+        if !event_access::is_allowed() {
+            if !requested_access {
+                let executable =
+                    std::env::current_exe().unwrap_or_else(|_| "hidpipe-client".into());
+                log!(
+                    "macOS blocks input injection; enable Accessibility for {}. Waiting without connecting to the server",
+                    executable.display()
+                );
+                event_access::request();
+                requested_access = true;
+            }
+            sleep(RETRY_INTERVAL);
+            continue;
+        }
+        if requested_access {
+            log!("macOS input injection access granted");
+            requested_access = false;
+        }
         match session(&args, Arc::clone(&pressed)) {
             Ok(()) => log!("peer closed the connection"),
             Err(e) => log!("connection interrupted: {e}"),
@@ -124,7 +145,15 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     loop {
         let frame = proto::read_frame(&mut stream)?;
         match frame {
-            Frame::Ping => proto::write_frame(&mut stream, &Frame::Pong)?,
+            Frame::Ping => {
+                if !event_access::is_allowed() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "macOS input injection access was revoked",
+                    ));
+                }
+                proto::write_frame(&mut stream, &Frame::Pong)?;
+            }
             Frame::Pointer(event) => {
                 let resolver = resolver
                     .as_mut()
@@ -556,7 +585,8 @@ Options:
   --flip-scroll   reverse scroll direction
   -h, --help      show this help
 
-On first run, grant the terminal access in System Settings > Privacy & Security > Accessibility.
+Grant this executable Accessibility access in System Settings > Privacy & Security > Accessibility.
+A launchd service needs its own permission; the terminal's permission does not cover it.
 ";
 
 impl Args {

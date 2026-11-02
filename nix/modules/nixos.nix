@@ -48,6 +48,19 @@ in
     services.udev.packages = lib.optional cfg.openlogi.enable cfg.openlogi.package;
     networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
 
+    systemd.services.openlogi-udev = lib.mkIf (cfg.openlogi.enable && config.services.udev.enable) {
+      description = "Apply OpenLogi permissions to connected Logitech HID devices";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "systemd-udevd.service" ];
+      after = [ "systemd-udevd.service" ];
+      restartTriggers = [ config.environment.etc."udev/rules.d".source ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${config.systemd.package}/bin/udevadm trigger --action=change --subsystem-match=hidraw --property-match=ID_VENDOR_ID=046d --settle";
+      };
+    };
+
     systemd.user.services.openlogi-agent = lib.mkIf cfg.openlogi.enable {
       description = "OpenLogi input owner and hidpipe pointer bridge";
       after = [ cfg.systemdTarget ];
@@ -66,6 +79,7 @@ in
       description = server.service.Unit.Description;
       after = server.service.Unit.After;
       partOf = server.service.Unit.PartOf;
+      wants = server.service.Unit.Wants;
       wantedBy = server.service.Install.WantedBy;
       unitConfig.ConditionUser = cfg.user;
       serviceConfig = server.service.Service;

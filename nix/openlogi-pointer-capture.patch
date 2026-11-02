@@ -1,0 +1,42 @@
+--- a/crates/openlogi-hook/src/linux.rs
++++ b/crates/openlogi-hook/src/linux.rs
+@@ -90,7 +90,9 @@
+     let mut stop_pipes: Vec<OwnedFd> = Vec::with_capacity(devices.len());
+ 
+     let result = (|| -> io::Result<()> {
+-        for (path, device) in devices {
++        for (path, mut device) in devices {
++            // Publish a hook only after every source is exclusively owned.
++            device.grab()?;
+             let virtual_device = build_virtual_device(&device)?;
+             let (rx, tx) = create_pipe()?;
+             let stop_clone = Arc::clone(&stop);
+@@ -262,7 +264,9 @@
+ }
+ 
+ fn build_virtual_device(device: &Device) -> io::Result<evdev::uinput::VirtualDevice> {
+-    let builder = VirtualDevice::builder()?.name(VIRTUAL_DEVICE_NAME);
++    let builder = VirtualDevice::builder()?
++        .name(VIRTUAL_DEVICE_NAME)
++        .input_id(device.input_id());
+ 
+     let builder = if let Some(keys) = device.supported_keys() {
+         builder.with_keys(keys)?
+@@ -421,17 +425,6 @@
+     stop: Arc<AtomicBool>,
+     stop_rx: OwnedFd,
+ ) {
+-    if let Err(e) = device.grab() {
+-        // Without the exclusive grab the desktop still receives the physical
+-        // events, so reading and re-injecting them here would duplicate every
+-        // one. Skip this device instead — it stays usable, just un-hooked.
+-        warn!(
+-            "failed to grab {} exclusively: {e} — skipping (left un-hooked)",
+-            path.display()
+-        );
+-        return;
+-    }
+-
+     let hires_scroll = device
+         .supported_relative_axes()
+         .is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES));

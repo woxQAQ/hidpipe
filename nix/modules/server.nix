@@ -71,6 +71,7 @@ in
         lib.optional (cfg.systemdTarget != "default.target") cfg.systemdTarget
         ++ lib.optional cfg.openlogi.enable "openlogi-agent.service";
       PartOf = [ cfg.systemdTarget ];
+      Wants = lib.optional cfg.openlogi.enable "openlogi-agent.service";
     };
     Service = {
       ExecStart = utils.escapeSystemdExecArgs (
