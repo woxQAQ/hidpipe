@@ -260,6 +260,20 @@ services.hidpipe.openlogi.highResolutionScroll = true;
 For manual operation, set `OPENLOGI_BRIDGE_WHEEL_HIRES=1` on the Linux agent.
 The wheel policy takes effect when that agent starts.
 
+On the Mac, hidpipe renders OpenLogi wheel input at 15 pixels per notch on both
+axes. To adjust the scroll distance, set the Home Manager option on the Mac
+(lower values scroll less):
+
+```nix
+services.hidpipe.scrollPixelsPerNotch = 15;
+```
+
+For manual operation, pass `--scroll-pixels-per-notch 15` to `hidpipe-client`.
+The range is 1–65535; 30 restores the previous scroll distance. Fractional pixels
+are accumulated, preserving high-resolution input at lower speeds. This setting
+does not affect local Linux scrolling, native evdev input, or OpenLogi bindings
+that generate their own scroll actions.
+
 Capture is a connection-scoped lease with a 750 ms heartbeat deadline. A held
 mouse button prevents entry. Disconnect, a stalled server, input-hook failure,
 or a full capture queue revokes the lease and restores Linux routing. Buttons
@@ -307,6 +321,7 @@ Switching works like this. Push the cursor past the right edge of the Linux scre
 |---|---|---|
 | `--port` | 24800 | server port |
 | `--flip-scroll` | off | reverse scroll direction |
+| `--scroll-pixels-per-notch` | 15 | OpenLogi scroll distance per notch, on both axes (1–65535) |
 
 ## Known limitations (v0, weekend prototype)
 

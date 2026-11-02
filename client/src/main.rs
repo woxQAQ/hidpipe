@@ -141,7 +141,7 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     )?;
     log!("connected to {}:{}", args.host, args.port);
 
-    let mut injector = Injector::new(args.flip_scroll, pressed);
+    let mut injector = Injector::new(args.flip_scroll, args.scroll_pixels_per_notch, pressed);
     loop {
         let frame = proto::read_frame(&mut stream)?;
         match frame {
@@ -193,6 +193,7 @@ struct Injector {
     source: CGEventSource,
     pressed: Arc<Mutex<PressedState>>,
     flip_scroll: bool,
+    scroll_pixels_per_notch: u16,
     /// Self-tracked cursor position. Querying the system position on every
     /// motion costs a WindowServer round trip per frame, which is measurable
     /// at 125Hz; within a session only we move the cursor, so self-tracking
@@ -202,11 +203,15 @@ struct Injector {
     /// Time window of leftward pushes while the cursor is clamped at the
     /// left edge, (timestamp, displacement).
     edge_pushes: VecDeque<(Instant, i32)>,
-    wheel_remainder: (i32, i32),
+    wheel_remainder: (i64, i64),
 }
 
 impl Injector {
-    fn new(flip_scroll: bool, pressed: Arc<Mutex<PressedState>>) -> Self {
+    fn new(
+        flip_scroll: bool,
+        scroll_pixels_per_notch: u16,
+        pressed: Arc<Mutex<PressedState>>,
+    ) -> Self {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .expect("failed to create CGEventSource; grant this program access in System Settings > Privacy & Security > Accessibility");
         let cursor = current_location(&source).unwrap_or_else(|| {
@@ -220,6 +225,7 @@ impl Injector {
             source,
             pressed,
             flip_scroll,
+            scroll_pixels_per_notch,
             cursor,
             edge_pushes: VecDeque::new(),
             wheel_remainder: (0, 0),
@@ -309,13 +315,19 @@ impl Injector {
                 );
             }
             PointerEvent::Wheel { dx, dy } => {
-                // Preserve sub-pixel high-resolution deltas across reports.
-                // A notch is 120 units, rendered as 30 pixels on macOS.
-                self.wheel_remainder.0 = self.wheel_remainder.0.saturating_add(dx);
-                self.wheel_remainder.1 = self.wheel_remainder.1.saturating_add(dy);
-                let (x, y) = (self.wheel_remainder.0 / 4, self.wheel_remainder.1 / 4);
-                self.wheel_remainder.0 %= 4;
-                self.wheel_remainder.1 %= 4;
+                // Scale 1/120-notch input to pixels, retaining fractional pixels.
+                let pixels = i64::from(self.scroll_pixels_per_notch);
+                self.wheel_remainder.0 += i64::from(dx) * pixels;
+                self.wheel_remainder.1 += i64::from(dy) * pixels;
+                let to_pixels = |value: i64| {
+                    (value / 120).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                };
+                let (x, y) = (
+                    to_pixels(self.wheel_remainder.0),
+                    to_pixels(self.wheel_remainder.1),
+                );
+                self.wheel_remainder.0 %= 120;
+                self.wheel_remainder.1 %= 120;
                 let sign = if self.flip_scroll { -1 } else { 1 };
                 if x != 0 || y != 0 {
                     self.scroll_units(
@@ -571,6 +583,8 @@ struct Args {
     /// not affect synthetic events; if scrolling comes out reversed, use
     /// this switch.
     flip_scroll: bool,
+    /// Pixels per notch for OpenLogi wheel events on either axis.
+    scroll_pixels_per_notch: u16,
     openlogi_socket: Option<std::path::PathBuf>,
 }
 
@@ -583,6 +597,7 @@ Options:
   --port <port>   server port (default 24800)
   --openlogi-socket <path>  resolve mouse input with the local OpenLogi agent
   --flip-scroll   reverse scroll direction
+  --scroll-pixels-per-notch <pixels>  OpenLogi scroll distance (1–65535, default 15)
   -h, --help      show this help
 
 Grant this executable Accessibility access in System Settings > Privacy & Security > Accessibility.
@@ -595,6 +610,7 @@ impl Args {
             host: String::new(),
             port: 24800,
             flip_scroll: false,
+            scroll_pixels_per_notch: 15,
             openlogi_socket: None,
         };
         let mut it = std::env::args().skip(1);
@@ -619,6 +635,16 @@ impl Args {
                             })
                             .into(),
                     );
+                }
+                "--scroll-pixels-per-notch" => {
+                    args.scroll_pixels_per_notch = it
+                        .next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .filter(|value| *value > 0)
+                        .unwrap_or_else(|| {
+                            eprintln!("--scroll-pixels-per-notch requires an integer from 1 to 65535\n{USAGE}");
+                            std::process::exit(2);
+                        });
                 }
                 "--flip-scroll" => args.flip_scroll = true,
                 "-h" | "--help" => {

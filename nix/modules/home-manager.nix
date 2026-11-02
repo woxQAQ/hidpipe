@@ -38,6 +38,16 @@ in
       description = "TCP port used by the server and client.";
     };
 
+    scrollPixelsPerNotch = lib.mkOption {
+      type = lib.types.ints.between 1 65535;
+      default = 15;
+      example = 10;
+      description = ''
+        Pixels per wheel notch for OpenLogi mouse input on macOS, on both axes.
+        Lower values reduce scroll speed. Native evdev input is unaffected.
+      '';
+    };
+
     flipScroll = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -101,6 +111,8 @@ in
               cfg.host
               "--port"
               (toString cfg.port)
+              "--scroll-pixels-per-notch"
+              (toString cfg.scrollPixelsPerNotch)
             ]
             ++ lib.optionals cfg.openlogi.enable [
               "--openlogi-socket"
