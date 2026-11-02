@@ -246,10 +246,12 @@ substring selecting exactly one physical Logitech mouse). Pass
 `--openlogi-socket <path>` to hidpipe on each machine. The agent's socket is
 local-only and versioned independently of GUI IPC.
 
-The main wheel uses ordinary kernel ticks by default, reducing accidental
-scrolling from sub-notch motion on both Linux and the remote Mac. The thumb
-wheel keeps its existing resolution. To retain smooth high-resolution main-wheel
-input, set this option on the Linux capture machine:
+The main wheel accumulates high-resolution movement into whole notches by
+default, reducing accidental scrolling on both Linux and the remote Mac. Partial
+movement expires after 250 ms of wheel inactivity, and the virtual device keeps
+its original wheel capabilities. The thumb wheel keeps its existing resolution.
+To retain smooth high-resolution main-wheel input, set this option on the Linux
+capture machine:
 
 ```nix
 services.hidpipe.openlogi.highResolutionScroll = true;

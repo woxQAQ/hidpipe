@@ -1,6 +1,7 @@
 //! Linux uinput integration probe. Run with:
 //! cargo run -p openlogi-hook --example hidpipe-capture
 //! The fixture never emits input until its source has been exclusively grabbed.
+//! Set LIBINPUT_DEBUG_EVENTS to the libinput executable to verify desktop delivery.
 
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
@@ -67,6 +68,44 @@ fn worker(stage: &str) -> Result<()> {
     Ok(())
 }
 
+fn desktop_probe() -> Result<Option<(std::process::Child, mpsc::Receiver<String>)>> {
+    let Some(tool) = std::env::var_os("LIBINPUT_DEBUG_EVENTS") else {
+        return Ok(None);
+    };
+    let (path, _) = evdev::enumerate()
+        .find(|(_, device)| {
+            device.name() == Some("OpenLogi virtual mouse") && device.input_id() == fixture_id()
+        })
+        .ok_or("virtual mouse missing for libinput")?;
+    let mut process = Command::new("timeout")
+        .args(["8s", "stdbuf", "-oL"])
+        .arg(tool)
+        .arg("debug-events")
+        .arg("--device")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = process.stdout.take().ok_or("missing libinput output")?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = receiver.recv_timeout(Duration::from_secs(3))?;
+        if line.contains("DEVICE_ADDED") {
+            break;
+        }
+    }
+    Ok(Some((process, receiver)))
+}
+
 fn wheel_worker(hires: bool) -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel(32);
     let _hook = Hook::start(move |event| {
@@ -77,11 +116,12 @@ fn wheel_worker(hires: bool) -> Result<()> {
     let axes = virtual_mouse
         .supported_relative_axes()
         .ok_or("missing axes")?;
-    if axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES) != hires
+    if !axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES)
         || !axes.contains(RelativeAxisCode::REL_HWHEEL_HI_RES)
     {
         return Err("virtual wheel capabilities disagree with delivery policy".into());
     }
+    let desktop = desktop_probe()?;
     println!("capture-ready");
     std::io::stdout().flush()?;
     let mut scrolls = Vec::new();
@@ -102,10 +142,14 @@ fn wheel_worker(hires: bool) -> Result<()> {
             (0.0, 119.0 / 120.0),
             (0.0, -1.0 / 120.0),
             (0.0, -119.0 / 120.0),
+            (0.0, 1.0),
             (0.5, 0.0),
+            (0.0, 0.5),
+            (0.0, 0.5),
+            (0.0, 0.5),
         ]
     } else {
-        vec![(0.0, 1.0), (0.0, -1.0), (0.5, 0.0)]
+        vec![(0.0, 1.0), (0.0, -1.0), (0.0, 1.0), (0.5, 0.0), (0.0, 1.0)]
     };
     if scrolls != expected {
         return Err(format!("callback wheel stream: {scrolls:?}, expected {expected:?}").into());
@@ -140,17 +184,51 @@ fn wheel_worker(hires: bool) -> Result<()> {
             (RelativeAxisCode::REL_WHEEL_HI_RES.0, 119),
             (RelativeAxisCode::REL_WHEEL_HI_RES.0, -1),
             (RelativeAxisCode::REL_WHEEL_HI_RES.0, -119),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
             (RelativeAxisCode::REL_HWHEEL_HI_RES.0, 60),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
         ]
     } else {
         vec![
-            (RelativeAxisCode::REL_WHEEL.0, 1),
-            (RelativeAxisCode::REL_WHEEL.0, -1),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, -120),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
             (RelativeAxisCode::REL_HWHEEL_HI_RES.0, 60),
+            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
         ]
     };
     if delivered != expected {
         return Err(format!("local wheel stream: {delivered:?}, expected {expected:?}").into());
+    }
+    finish_desktop_probe(desktop)
+}
+
+fn finish_desktop_probe(
+    desktop: Option<(std::process::Child, mpsc::Receiver<String>)>,
+) -> Result<()> {
+    if let Some((mut process, receiver)) = desktop {
+        let result: Result<()> = loop {
+            match receiver.recv_timeout(Duration::from_secs(3)) {
+                Ok(line)
+                    if line.contains("POINTER_SCROLL_WHEEL")
+                        && line
+                            .split_once("vert ")
+                            .and_then(|(_, axes)| axes.split('/').next())
+                            .and_then(|delta| delta.parse::<f64>().ok())
+                            .is_some_and(|delta| delta != 0.0) =>
+                {
+                    eprintln!("libinput accepted vertical wheel: {line}");
+                    break Ok(());
+                }
+                Ok(_) => {}
+                Err(error) => break Err(error.into()),
+            }
+        };
+        let _ = process.kill();
+        let _ = process.wait();
+        result?;
     }
     Ok(())
 }
@@ -214,10 +292,26 @@ fn main() -> Result<()> {
                 (RelativeAxisCode::REL_WHEEL_HI_RES, -1),
                 (RelativeAxisCode::REL_WHEEL_HI_RES, -119),
                 (RelativeAxisCode::REL_WHEEL, -1),
+                // A source may report a complete notch without a coarse companion.
+                (RelativeAxisCode::REL_WHEEL_HI_RES, 120),
                 (RelativeAxisCode::REL_HWHEEL_HI_RES, 60),
                 (RelativeAxisCode::REL_HWHEEL, 1),
             ] {
                 fixture.emit(&[InputEvent::new(EventType::RELATIVE.0, axis.0, value)])?;
+            }
+            // Stale partial movement cannot contribute to a later gesture.
+            fixture.emit(&[InputEvent::new(
+                EventType::RELATIVE.0,
+                RelativeAxisCode::REL_WHEEL_HI_RES.0,
+                60,
+            )])?;
+            std::thread::sleep(Duration::from_millis(300));
+            for _ in 0..2 {
+                fixture.emit(&[InputEvent::new(
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_WHEEL_HI_RES.0,
+                    60,
+                )])?;
             }
         }
         fixture.emit(&[InputEvent::new(
