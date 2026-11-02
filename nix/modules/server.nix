@@ -67,7 +67,9 @@ in
   service = {
     Unit = {
       Description = "hidpipe input capture";
-      After = lib.optional (cfg.systemdTarget != "default.target") cfg.systemdTarget;
+      After =
+        lib.optional (cfg.systemdTarget != "default.target") cfg.systemdTarget
+        ++ lib.optional cfg.openlogi.enable "openlogi-agent.service";
       PartOf = [ cfg.systemdTarget ];
     };
     Service = {
@@ -86,6 +88,10 @@ in
         ++ lib.optionals (cfg.mouse != null) [
           "--mouse"
           cfg.mouse
+        ]
+        ++ lib.optionals cfg.openlogi.enable [
+          "--openlogi-socket"
+          cfg.openlogi.socket
         ]
         ++ lib.optional cfg.swapCapsEsc "--swap-caps-esc"
       );

@@ -22,6 +22,7 @@
         {
           default = package;
           ${package.pname} = package;
+          openlogi = pkgs.callPackage ./nix/openlogi-package.nix { };
         }
       );
 

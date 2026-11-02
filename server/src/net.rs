@@ -20,7 +20,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(6);
 pub enum NetMsg {
     /// The pending connection's first frame was a version-matching Hello;
     /// it may take over.
-    Hello(u64),
+    Hello(u64, bool),
     /// The client asks to hand control back (cursor pushed against the
     /// Mac's left edge).
     ReturnToLocal(u64),
@@ -32,6 +32,7 @@ pub enum NetMsg {
 pub struct Connection {
     pub id: u64,
     tx: Sender<Frame>,
+    shutdown: TcpStream,
 }
 
 impl Connection {
@@ -39,6 +40,7 @@ impl Connection {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         let reader = stream.try_clone()?;
+        let shutdown = stream.try_clone()?;
         let (tx, rx) = mpsc::channel::<Frame>();
         thread::spawn({
             let net_tx = net_tx.clone();
@@ -48,7 +50,7 @@ impl Connection {
             let tx = tx.clone();
             move || reader_loop(reader, tx, net_tx, id)
         });
-        Ok(Self { id, tx })
+        Ok(Self { id, tx, shutdown })
     }
 
     /// A failed send means the peer is dead; the read/write threads report
@@ -58,8 +60,11 @@ impl Connection {
     }
 }
 
-// When the main loop drops the Connection the channel closes and the
-// writer exits; the reader exits at the latest after one read timeout (6s).
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+    }
+}
 
 fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg>, id: u64) {
     // Pings must go out on schedule, independent of data traffic. If we
@@ -72,7 +77,10 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg
         let frame = match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
             Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => Frame::Ping,
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
         };
         if matches!(frame, Frame::Ping) {
             next_ping = Instant::now() + PING_INTERVAL;
@@ -92,8 +100,8 @@ fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>,
     // port (such as deskflow's retry loop) from knocking out a healthy
     // connection.
     match proto::read_frame(&mut stream) {
-        Ok(Frame::Hello { version }) if version == proto::VERSION => {
-            let _ = net_tx.send(NetMsg::Hello(id));
+        Ok(Frame::Hello { version, openlogi }) if version == proto::VERSION => {
+            let _ = net_tx.send(NetMsg::Hello(id, openlogi));
         }
         _ => {
             let _ = net_tx.send(NetMsg::Dead(id));

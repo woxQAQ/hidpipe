@@ -27,7 +27,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use evdev::{Device, InputEventKind, Key, RelativeAxisType};
-use hidpipe_proto::{ButtonState, Frame, KeyState, MouseButton};
+use hidpipe_proto::{bridge::Capture, ButtonState, Frame, KeyState, MouseButton};
 
 use args::Args;
 use barrier::BarrierEvent;
@@ -59,19 +59,24 @@ fn main() -> io::Result<()> {
     let (barrier_tx, barrier_rx) = mpsc::channel::<BarrierEvent>();
     barrier::spawn(barrier_tx)?;
     let (kbd, kbd_path) = open_device(DeviceKind::Keyboard, args.keyboard.as_deref())?;
-    let (mouse, mouse_path) = open_device(DeviceKind::Mouse, args.mouse.as_deref())?;
+    let mouse = if args.openlogi_socket.is_some() {
+        None
+    } else {
+        let (mouse, path) = open_device(DeviceKind::Mouse, args.mouse.as_deref())?;
+        log!(
+            "mouse: {} ({})",
+            mouse.name().unwrap_or("?"),
+            path.display()
+        );
+        set_nonblocking(&mouse)?;
+        Some(mouse)
+    };
     log!(
         "keyboard: {} ({})",
         kbd.name().unwrap_or("?"),
         kbd_path.display()
     );
-    log!(
-        "mouse: {} ({})",
-        mouse.name().unwrap_or("?"),
-        mouse_path.display()
-    );
     set_nonblocking(&kbd)?;
-    set_nonblocking(&mouse)?;
 
     let listener = TcpListener::bind((args.bind.as_str(), args.port))?;
     listener.set_nonblocking(true)?;
@@ -81,6 +86,8 @@ fn main() -> io::Result<()> {
     let mut app = App {
         kbd,
         mouse,
+        openlogi_socket: args.openlogi_socket,
+        capture: None,
         conn: None,
         pending: None,
         conn_id: 0,
@@ -107,7 +114,9 @@ fn main() -> io::Result<()> {
 
 struct App {
     kbd: Device,
-    mouse: Device,
+    mouse: Option<Device>,
+    openlogi_socket: Option<PathBuf>,
+    capture: Option<Capture>,
     /// Connection that passed the handshake and is now serving.
     conn: Option<Connection>,
     /// Freshly accepted connection that has not passed the handshake yet.
@@ -149,8 +158,14 @@ impl App {
     fn handle_net_msgs(&mut self) {
         while let Ok(msg) = self.net_rx.try_recv() {
             match msg {
-                NetMsg::Hello(id) => {
+                NetMsg::Hello(id, openlogi) => {
                     if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
+                        if openlogi != self.openlogi_socket.is_some() {
+                            log!("pointer backend mismatch; both peers must enable OpenLogi together");
+                            self.pending = None;
+                            continue;
+                        }
+                        self.leave_remote();
                         let (conn, addr) = self.pending.take().expect("checked above");
                         log!("client ready: {addr}");
                         // A handshaken connection is allowed to take over;
@@ -172,7 +187,6 @@ impl App {
                 NetMsg::ReturnToLocal(id) => {
                     if self.conn.as_ref().is_some_and(|c| c.id == id) && self.mode == Mode::Remote {
                         log!("peer edge trigger, handing control back");
-                        self.send(Frame::ReleaseAll);
                         self.leave_remote();
                     }
                 }
@@ -221,7 +235,32 @@ impl App {
     }
 
     fn drain_mouse(&mut self) {
-        let events = match fetch_all(&mut self.mouse) {
+        if let Some(capture) = self.capture.as_mut() {
+            let mut events = Vec::new();
+            let mut failure = None;
+            for _ in 0..1024 {
+                match capture.poll() {
+                    Ok(Some(event)) => events.push(event),
+                    Ok(None) => break,
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            for event in events {
+                self.send(Frame::Pointer(event));
+            }
+            if let Some(e) = failure {
+                log!("OpenLogi capture failed ({e}), back to local mode");
+                self.leave_remote();
+            }
+            return;
+        }
+        let Some(mouse) = self.mouse.as_mut() else {
+            return;
+        };
+        let events = match fetch_all(mouse) {
             Ok(events) => events,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
@@ -325,7 +364,16 @@ impl App {
             log!("no client connected, staying local");
             return;
         }
-        if let Err(e) = self.kbd.grab().and_then(|()| self.mouse.grab()) {
+        let setup = (|| -> io::Result<()> {
+            self.kbd.grab()?;
+            if let Some(path) = self.openlogi_socket.as_ref() {
+                self.capture = Some(Capture::connect(path)?);
+            } else if let Some(mouse) = self.mouse.as_mut() {
+                mouse.grab()?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = setup {
             log!("grab failed, staying local: {e}");
             self.ungrab_all();
             return;
@@ -336,6 +384,7 @@ impl App {
 
     fn leave_remote(&mut self) {
         if self.mode == Mode::Remote {
+            self.send(Frame::ReleaseAll);
             self.ungrab_all();
             self.mode = Mode::Local;
         }
@@ -344,8 +393,11 @@ impl App {
     }
 
     fn ungrab_all(&mut self) {
+        self.capture = None;
         let _ = self.kbd.ungrab();
-        let _ = self.mouse.ungrab();
+        if let Some(mouse) = self.mouse.as_mut() {
+            let _ = mouse.ungrab();
+        }
     }
 
     fn send(&self, frame: Frame) {

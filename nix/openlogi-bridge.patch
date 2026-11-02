@@ -1,0 +1,1308 @@
+diff --git a/crates/openlogi-agent-core/src/hook_runtime.rs b/crates/openlogi-agent-core/src/hook_runtime.rs
+index a5fa0587..51ae0800 100644
+--- a/crates/openlogi-agent-core/src/hook_runtime.rs
++++ b/crates/openlogi-agent-core/src/hook_runtime.rs
+@@ -315,6 +315,10 @@ pub fn start(
+     // callback must never block — see the freeze-hazard note in `macos.rs`.
+     let result = Hook::start(move |event| match event {
+         HookEvent::Mouse(event) => {
++            #[cfg(unix)]
++            if let Some(disposition) = crate::remote::hook_input(&event) {
++                return disposition;
++            }
+             monitor.record(&event);
+             match event {
+                 MouseEvent::Button {
+diff --git a/crates/openlogi-agent-core/src/lib.rs b/crates/openlogi-agent-core/src/lib.rs
+index 743c1d25..98d109fb 100644
+--- a/crates/openlogi-agent-core/src/lib.rs
++++ b/crates/openlogi-agent-core/src/lib.rs
+@@ -16,6 +16,8 @@ pub mod hook_runtime;
+ pub mod ipc;
+ pub mod orchestrator;
+ pub mod receiver_access;
++#[cfg(unix)]
++pub mod remote;
+ pub mod transport;
+ pub mod watchers;
+ 
+diff --git a/crates/openlogi-agent-core/src/orchestrator.rs b/crates/openlogi-agent-core/src/orchestrator.rs
+index 2e502883..532d533b 100644
+--- a/crates/openlogi-agent-core/src/orchestrator.rs
++++ b/crates/openlogi-agent-core/src/orchestrator.rs
+@@ -273,6 +273,18 @@ impl Orchestrator {
+     /// forget the other — a waking device needs both its capture session and
+     /// its DPI-cycle slot.
+     fn publish_device_runtime(&self) {
++        #[cfg(unix)]
++        crate::remote::publish(
++            &self.config,
++            self.current_app.as_deref(),
++            self.devices
++                .iter()
++                .find(|device| {
++                    device.online
++                        && matches!(device.kind, DeviceKind::Mouse | DeviceKind::Trackball)
++                })
++                .map(|device| device.config_key.as_str()),
++        );
+         write_value(
+             &self.shared.capture_plans,
+             self.capture_plans_for(),
+diff --git a/crates/openlogi-agent-core/src/remote.rs b/crates/openlogi-agent-core/src/remote.rs
+new file mode 100644
+index 00000000..bfeb2ef0
+--- /dev/null
++++ b/crates/openlogi-agent-core/src/remote.rs
+@@ -0,0 +1,494 @@
++//! Opt-in local pointer routing for hidpipe. The GUI IPC remains independent.
++//!
++//! One capture lease routes the configured Linux mouse before binding lookup.
++//! An input-resolution connection uses this machine's profile and app context.
++//! The socket must live in a private user directory; no network listener exists.
++
++mod engine;
++/// Fixed-size bridge records shared with hidpipe.
++pub mod wire;
++
++use std::io::{self, Read, Write};
++use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
++use std::os::unix::net::{UnixListener, UnixStream};
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++use std::sync::mpsc::{self, SyncSender};
++use std::sync::{Arc, Mutex, OnceLock, RwLock};
++use std::thread;
++use std::time::Duration;
++
++use openlogi_core::config::Config;
++use openlogi_hid::gesture::CapturedInput;
++use openlogi_hook::{EventDisposition, MouseEvent};
++use tracing::warn;
++
++use crate::orchestrator::SharedRuntime;
++use engine::{Effect, Engine, Profile, button_number};
++use wire::{MAGIC, PointerEvent};
++
++static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
++const TIMEOUT: Duration = Duration::from_millis(750);
++
++struct Lease {
++    events: SyncSender<PointerEvent>,
++    alive: Arc<AtomicBool>,
++}
++
++#[derive(Default)]
++struct Routing {
++    lease: Option<Lease>,
++}
++
++/// Explicit bridge configuration. Socket activation is disabled by default.
++pub struct Options {
++    /// Socket in a directory owned by the current user, with mode 0700.
++    pub socket: PathBuf,
++    /// This machine's per-device config key, independent of the peer's key.
++    pub device: String,
++}
++
++/// Bridge state, owned for the lifetime of the agent.
++pub struct Bridge {
++    options: Options,
++    profile: RwLock<Profile>,
++    key: RwLock<String>,
++    hook_ready: AtomicBool,
++    hid_ready: AtomicBool,
++    capture_active: AtomicBool,
++    capture_fault: AtomicBool,
++    down: AtomicU8,
++    quarantine: AtomicU8,
++    routing: Mutex<Routing>,
++    local_engine: Mutex<Engine>,
++    effects: SyncSender<Effect>,
++    receiver: Mutex<Option<mpsc::Receiver<Effect>>>,
++}
++
++/// Install an explicit bridge. Capture and resolution remain separate leases.
++pub fn install(options: Options, config: &Config) -> io::Result<Arc<Bridge>> {
++    let (effects, receiver) = mpsc::sync_channel(256);
++    let bridge = Arc::new(Bridge {
++        profile: RwLock::new(Profile::new(config, &options.device, None)),
++        key: RwLock::new(options.device.clone()),
++        hook_ready: AtomicBool::new(false),
++        hid_ready: AtomicBool::new(false),
++        capture_active: AtomicBool::new(false),
++        capture_fault: AtomicBool::new(false),
++        down: AtomicU8::new(0),
++        quarantine: AtomicU8::new(0),
++        options,
++        routing: Mutex::new(Routing::default()),
++        local_engine: Mutex::new(Engine::default()),
++        effects,
++        receiver: Mutex::new(Some(receiver)),
++    });
++    BRIDGE
++        .set(Arc::clone(&bridge))
++        .map_err(|_| io::Error::other("pointer bridge already installed"))?;
++    Ok(bridge)
++}
++
++/// Read opt-in configuration. A Mac may reuse its already selected device key.
++pub fn install_from_env(config: &Config) -> io::Result<Option<Arc<Bridge>>> {
++    let Some(socket) = std::env::var_os("OPENLOGI_BRIDGE_SOCKET") else {
++        return Ok(None);
++    };
++    let device = std::env::var("OPENLOGI_BRIDGE_DEVICE")
++        .ok()
++        .or_else(|| {
++            if cfg!(target_os = "macos") {
++                config.selected_device().map(str::to_owned)
++            } else {
++                None
++            }
++        })
++        .unwrap_or_else(|| "auto".to_owned());
++    install(
++        Options {
++            socket: socket.into(),
++            device,
++        },
++        config,
++    )
++    .map(Some)
++}
++
++/// Whether this device needs capture independent of its local bindings.
++#[must_use]
++pub fn enabled_for(key: &str) -> bool {
++    cfg!(target_os = "linux")
++        && BRIDGE
++            .get()
++            .is_some_and(|bridge| bridge.key.read().is_ok_and(|current| *current == key))
++}
++
++/// Publish the configured device's profile using this machine's app context.
++pub fn publish(config: &Config, app: Option<&str>, fallback: Option<&str>) {
++    if let Some(bridge) = BRIDGE.get()
++        && let (Ok(mut profile), Ok(mut key)) = (bridge.profile.write(), bridge.key.write())
++    {
++        let selected = if bridge.options.device == "auto" {
++            fallback.or(config.selected_device()).unwrap_or("auto")
++        } else {
++            &bridge.options.device
++        };
++        if *key != selected {
++            bridge.hid_ready.store(false, Ordering::Release);
++            bridge.capture_fault.store(true, Ordering::Release);
++            selected.clone_into(&mut key);
++        }
++        *profile = Profile::new(config, &key, app);
++    }
++}
++
++/// Publish native-hook readiness; a failed hook must not acquire a capture lease.
++pub fn hook_ready(ready: bool) {
++    if let Some(bridge) = BRIDGE.get() {
++        bridge.hook_ready.store(ready, Ordering::Release);
++        if !ready {
++            bridge.capture_fault.store(true, Ordering::Release);
++        }
++    }
++}
++
++impl Bridge {
++    /// Bind the private local socket and start the action and connection workers.
++    pub fn serve(self: &Arc<Self>, shared: SharedRuntime) -> io::Result<()> {
++        let parent = self
++            .options
++            .socket
++            .parent()
++            .ok_or_else(|| io::Error::other("socket needs a private directory"))?;
++        std::fs::DirBuilder::new()
++            .recursive(true)
++            .mode(0o700)
++            .create(parent)?;
++        let parent_meta = std::fs::symlink_metadata(parent)?;
++        if !parent_meta.is_dir() || parent_meta.permissions().mode() & 0o077 != 0 {
++            return Err(io::Error::other(
++                "bridge socket directory must have mode 0700",
++            ));
++        }
++        if self.options.socket.exists() {
++            if UnixStream::connect(&self.options.socket).is_ok() {
++                return Err(io::ErrorKind::AddrInUse.into());
++            }
++            std::fs::remove_file(&self.options.socket)?;
++        }
++        let listener = UnixListener::bind(&self.options.socket)?;
++        std::fs::set_permissions(&self.options.socket, std::fs::Permissions::from_mode(0o600))?;
++        let receiver = self
++            .receiver
++            .lock()
++            .map_err(|_| io::Error::other("bridge poisoned"))?
++            .take()
++            .ok_or_else(|| io::Error::other("bridge already serving"))?;
++        let owner = Arc::clone(self);
++        thread::spawn(move || {
++            while let Ok(effect) = receiver.recv() {
++                let key = owner
++                    .key
++                    .read()
++                    .map_or_else(|_| owner.options.device.clone(), |key| key.clone());
++                match effect {
++                    Effect::Action(action) => crate::hook_runtime::dispatch_action(
++                        &action,
++                        &shared.dpi_cycle,
++                        Some(&key),
++                        &shared.capture_channel,
++                        Some(&shared.channel_registry),
++                        &shared.receiver_access,
++                    ),
++                    Effect::Scroll(lines) => openlogi_inject::post_horizontal_scroll(lines),
++                }
++            }
++        });
++        let bridge = Arc::clone(self);
++        thread::spawn(move || {
++            for stream in listener.incoming() {
++                match stream {
++                    Ok(stream) => {
++                        let bridge = Arc::clone(&bridge);
++                        thread::spawn(move || {
++                            if let Err(error) = bridge.connection(stream) {
++                                tracing::debug!(%error, "pointer bridge connection ended");
++                            }
++                        });
++                    }
++                    Err(error) => warn!(%error, "pointer bridge accept failed"),
++                }
++            }
++        });
++        Ok(())
++    }
++
++    fn connection(self: &Arc<Self>, mut stream: UnixStream) -> io::Result<()> {
++        stream.set_read_timeout(Some(TIMEOUT))?;
++        stream.set_write_timeout(Some(TIMEOUT))?;
++        let mut hello = [0; 6];
++        stream.read_exact(&mut hello)?;
++        if hello[..5] != MAGIC {
++            return Err(io::ErrorKind::InvalidData.into());
++        }
++        match hello[5] {
++            0 if cfg!(target_os = "linux") => self.capture_connection(stream),
++            1 if openlogi_hook::Hook::has_accessibility() => self.resolve_connection(stream),
++            _ => Err(io::ErrorKind::InvalidData.into()),
++        }
++    }
++
++    fn capture_connection(self: &Arc<Self>, mut stream: UnixStream) -> io::Result<()> {
++        let (events, receiver) = mpsc::sync_channel(1024);
++        if !self.hook_ready.load(Ordering::Acquire) || !self.hid_ready.load(Ordering::Acquire) {
++            stream.write_all(&[1])?;
++            return Err(io::Error::other(
++                "pointer hook or HID++ capture is not ready",
++            ));
++        }
++        let alive = Arc::new(AtomicBool::new(true));
++        {
++            let mut routing = self
++                .routing
++                .lock()
++                .map_err(|_| io::Error::other("bridge poisoned"))?;
++            if routing.lease.is_some() {
++                drop(routing);
++                stream.write_all(&[1])?;
++                return Err(io::Error::other("mouse is already leased"));
++            }
++            // Publish capture intent before testing held buttons. A concurrent
++            // callback either makes the admission check fail, or suppresses the
++            // event and faults this lease; it cannot deliver half a local click.
++            self.capture_fault.store(false, Ordering::Release);
++            self.capture_active.store(true, Ordering::SeqCst);
++            if self.down.load(Ordering::SeqCst) != 0 {
++                self.capture_active.store(false, Ordering::SeqCst);
++                drop(routing);
++                stream.write_all(&[1])?;
++                return Err(io::Error::other("mouse is held"));
++            }
++            routing.lease = Some(Lease {
++                events,
++                alive: Arc::clone(&alive),
++            });
++        }
++        let guard = CaptureGuard {
++            bridge: Arc::clone(self),
++            alive: Arc::clone(&alive),
++        };
++        // ACK is ordered before captured input. Dropping the guard handles all
++        // failure paths, including a partial handshake or a stalled writer.
++        stream.write_all(&[0])?;
++        let mut writer = stream.try_clone()?;
++        let writer_alive = Arc::clone(&alive);
++        let bridge = Arc::clone(self);
++        thread::spawn(move || {
++            while writer_alive.load(Ordering::Acquire)
++                && !bridge.capture_fault.load(Ordering::Acquire)
++            {
++                match receiver.recv_timeout(Duration::from_millis(20)) {
++                    Ok(event) => {
++                        if event.write(&mut writer).is_err() {
++                            break;
++                        }
++                    }
++                    Err(mpsc::RecvTimeoutError::Timeout) => {}
++                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
++                }
++            }
++            writer_alive.store(false, Ordering::Release);
++            let _ = writer.shutdown(std::net::Shutdown::Both);
++        });
++        while alive.load(Ordering::Acquire) {
++            let mut heartbeat = [0];
++            if stream.read_exact(&mut heartbeat).is_err() || heartbeat != [0] {
++                break;
++            }
++        }
++        drop(guard);
++        Ok(())
++    }
++
++    fn resolve_connection(&self, mut stream: UnixStream) -> io::Result<()> {
++        // Idle is normal on the destination. A partial record is bounded by
++        // hidpipe's write deadline; EOF drops all resolver state without actions.
++        stream.set_read_timeout(None)?;
++        stream.write_all(&[0])?;
++        let mut engine = Engine::default();
++        loop {
++            let event = PointerEvent::read(&mut stream)?;
++            let profile = self
++                .profile
++                .read()
++                .map_err(|_| io::Error::other("profile poisoned"))?;
++            let result = engine.process(event, &profile);
++            drop(profile);
++            for effect in result.effects {
++                self.effects
++                    .try_send(effect)
++                    .map_err(|_| io::Error::other("action queue unavailable"))?;
++            }
++            stream.write_all(&[u8::from(!result.pass)])?;
++        }
++    }
++
++    fn route(&self, event: PointerEvent) -> bool {
++        let mut quarantined = false;
++        if let PointerEvent::Button { button, pressed } = event {
++            let mask = 1u8 << button;
++            quarantined = self.quarantine.load(Ordering::Acquire) & mask != 0;
++            if pressed {
++                self.down.fetch_or(mask, Ordering::SeqCst);
++            } else {
++                self.down.fetch_and(!mask, Ordering::SeqCst);
++                self.quarantine.fetch_and(!mask, Ordering::AcqRel);
++            }
++        }
++        let Ok(routing) = self.routing.try_lock() else {
++            let active = self.capture_active.load(Ordering::SeqCst);
++            if active {
++                self.capture_fault.store(true, Ordering::Release);
++            }
++            return active;
++        };
++        if let Some(lease) = routing.lease.as_ref() {
++            if lease.alive.load(Ordering::Acquire) && lease.events.try_send(event).is_ok() {
++                return true;
++            }
++            lease.alive.store(false, Ordering::Release);
++            self.quarantine
++                .store(self.down.load(Ordering::Acquire), Ordering::Release);
++            // The current event still belongs to the failed remote session.
++            return true;
++        }
++        quarantined
++            || matches!(event, PointerEvent::GestureMotion { .. })
++                && self.quarantine.load(Ordering::Acquire) & (1 << 5) != 0
++    }
++
++    fn local(&self, event: PointerEvent) {
++        let (Ok(mut engine), Ok(profile)) = (self.local_engine.try_lock(), self.profile.try_read())
++        else {
++            return;
++        };
++        for effect in engine.process(event, &profile).effects {
++            if self.effects.try_send(effect).is_err() {
++                warn!("pointer action queue unavailable");
++            }
++        }
++    }
++}
++
++struct CaptureGuard {
++    bridge: Arc<Bridge>,
++    alive: Arc<AtomicBool>,
++}
++
++impl Drop for CaptureGuard {
++    fn drop(&mut self) {
++        self.alive.store(false, Ordering::Release);
++        self.bridge.capture_active.store(false, Ordering::Release);
++        if let Ok(mut routing) = self.bridge.routing.lock() {
++            self.bridge
++                .quarantine
++                .store(self.bridge.down.load(Ordering::Acquire), Ordering::Release);
++            routing.lease = None;
++        }
++        if let Ok(mut engine) = self.bridge.local_engine.lock() {
++            *engine = Engine::default();
++        }
++    }
++}
++
++/// Intercept Linux OS-hook input before applying Linux bindings.
++#[must_use]
++pub fn hook_input(event: &MouseEvent) -> Option<EventDisposition> {
++    if !cfg!(target_os = "linux") {
++        return None;
++    }
++    let bridge = BRIDGE.get()?;
++    if matches!(event, MouseEvent::CaptureInterrupted) {
++        bridge.hook_ready.store(false, Ordering::Release);
++        bridge.capture_fault.store(true, Ordering::Release);
++    }
++    let event = match event {
++        MouseEvent::Button { id, pressed, .. } => PointerEvent::Button {
++            button: button_number(*id)?,
++            pressed: *pressed,
++        },
++        MouseEvent::Moved { delta_x, delta_y } => PointerEvent::Motion {
++            dx: *delta_x,
++            dy: *delta_y,
++        },
++        MouseEvent::Scroll {
++            delta_x, delta_y, ..
++        } => PointerEvent::Wheel {
++            dx: wheel_units(*delta_x),
++            dy: wheel_units(*delta_y),
++        },
++        MouseEvent::CaptureInterrupted => PointerEvent::Reset,
++    };
++    bridge.route(event).then_some(EventDisposition::Suppress)
++}
++
++#[expect(
++    clippy::cast_possible_truncation,
++    reason = "rounded, saturating conversion to wire wheel units"
++)]
++fn wheel_units(delta: f32) -> i32 {
++    (delta * 120.0).round() as i32
++}
++
++/// Handle selected-device HID++ controls before any Linux binding is resolved.
++#[must_use]
++pub fn captured(key: &str, input: CapturedInput) -> bool {
++    if !cfg!(target_os = "linux") || !enabled_for(key) {
++        return false;
++    }
++    let Some(bridge) = BRIDGE.get() else {
++        return false;
++    };
++    let event = match input {
++        CapturedInput::Ready => {
++            bridge.hid_ready.store(true, Ordering::Release);
++            None
++        }
++        CapturedInput::Interrupted => {
++            bridge.hid_ready.store(false, Ordering::Release);
++            bridge.capture_fault.store(true, Ordering::Release);
++            bridge.local(PointerEvent::Reset);
++            None
++        }
++        CapturedInput::RawButton { button, pressed } => {
++            button_number(button).map(|button| PointerEvent::Button { button, pressed })
++        }
++        CapturedInput::RawMotion { dx, dy } => Some(PointerEvent::GestureMotion {
++            dx: i32::from(dx),
++            dy: i32::from(dy),
++        }),
++        CapturedInput::Scroll(delta) => Some(PointerEvent::ThumbWheel(i32::from(delta))),
++        CapturedInput::ButtonPressed(openlogi_core::binding::ButtonId::Thumbwheel, _) => {
++            for pressed in [true, false] {
++                let event = PointerEvent::Button { button: 7, pressed };
++                if !bridge.route(event) {
++                    bridge.local(event);
++                }
++            }
++            None
++        }
++        _ => None,
++    };
++    if let Some(event) = event
++        && !bridge.route(event)
++    {
++        bridge.local(event);
++    }
++    true
++}
++
++/// Socket location for diagnostics.
++#[must_use]
++pub fn socket_path() -> Option<&'static Path> {
++    BRIDGE.get().map(|bridge| bridge.options.socket.as_path())
++}
+diff --git a/crates/openlogi-agent-core/src/remote/engine.rs b/crates/openlogi-agent-core/src/remote/engine.rs
+new file mode 100644
+index 00000000..cfa915d5
+--- /dev/null
++++ b/crates/openlogi-agent-core/src/remote/engine.rs
+@@ -0,0 +1,158 @@
++//! Binding resolution for an explicitly connected remote pointer.
++
++use std::collections::{BTreeMap, HashMap};
++use std::time::Instant;
++
++use openlogi_core::binding::{Action, ButtonId, GestureDirection, SwipeAccumulator};
++use openlogi_core::config::Config;
++
++use super::wire::PointerEvent;
++use crate::bindings::{bindings_for, gesture_bindings_for, oshook_gestures_for};
++use crate::watchers::gesture::{WheelAccumulators, WheelOutput, advance};
++
++pub(super) struct Profile {
++    bindings: BTreeMap<ButtonId, Action>,
++    gestures: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
++    sensitivity: i32,
++}
++
++impl Profile {
++    pub(super) fn new(config: &Config, key: &str, app: Option<&str>) -> Self {
++        let mut gestures = oshook_gestures_for(config, Some(key), app);
++        let dedicated = gesture_bindings_for(config, Some(key));
++        if !dedicated.is_empty() {
++            gestures.insert(ButtonId::GestureButton, dedicated);
++        }
++        Self {
++            bindings: bindings_for(config, Some(key), app),
++            gestures,
++            sensitivity: config.thumbwheel_sensitivity(key),
++        }
++    }
++}
++
++pub(super) enum Effect {
++    Action(Action),
++    Scroll(i32),
++}
++
++#[derive(Default)]
++pub(super) struct Resolution {
++    pub pass: bool,
++    pub effects: Vec<Effect>,
++}
++
++struct Press {
++    pass: bool,
++    gesture: Option<(SwipeAccumulator, BTreeMap<GestureDirection, Action>)>,
++}
++
++#[derive(Default)]
++pub(super) struct Engine {
++    presses: HashMap<u8, Press>,
++    wheel: WheelAccumulators,
++}
++
++impl Engine {
++    pub(super) fn process(&mut self, event: PointerEvent, profile: &Profile) -> Resolution {
++        let mut result = Resolution::default();
++        match event {
++            PointerEvent::Reset => *self = Self::default(),
++            PointerEvent::Button { button, pressed } => {
++                if pressed {
++                    if self.presses.contains_key(&button) {
++                        return result;
++                    }
++                    let Some(id) = button_id(button) else {
++                        return result;
++                    };
++                    let gesture = profile.gestures.get(&id).map(|map| {
++                        let mut swipe = SwipeAccumulator::default();
++                        swipe.begin();
++                        (swipe, map.clone())
++                    });
++                    let action = profile.bindings.get(&id).cloned().unwrap_or(Action::None);
++                    let pass = gesture.is_none()
++                        && matches!(
++                            (id, &action),
++                            (ButtonId::LeftClick, Action::LeftClick)
++                                | (ButtonId::RightClick, Action::RightClick)
++                                | (ButtonId::MiddleClick, Action::MiddleClick)
++                        );
++                    if !pass && gesture.is_none() {
++                        result.effects.push(Effect::Action(action));
++                    }
++                    self.presses.insert(button, Press { pass, gesture });
++                    result.pass = pass;
++                } else if let Some(mut press) = self.presses.remove(&button) {
++                    result.pass = press.pass;
++                    if let Some((swipe, map)) = press.gesture.as_mut()
++                        && swipe.end()
++                        && let Some(action) = map.get(&GestureDirection::Click)
++                    {
++                        result.effects.push(Effect::Action(action.clone()));
++                    }
++                }
++            }
++            PointerEvent::Motion { dx, dy } | PointerEvent::GestureMotion { dx, dy } => {
++                let dedicated = matches!(event, PointerEvent::GestureMotion { .. });
++                result.pass = !dedicated;
++                for (&button, press) in &mut self.presses {
++                    if (button == 5) != dedicated {
++                        continue;
++                    }
++                    if let Some((swipe, map)) = press.gesture.as_mut() {
++                        result.pass = false;
++                        if let Some(direction) = swipe.accumulate(dx, dy)
++                            && let Some(action) = map.get(&direction)
++                        {
++                            result.effects.push(Effect::Action(action.clone()));
++                        }
++                    }
++                }
++            }
++            PointerEvent::Wheel { .. } => result.pass = true,
++            PointerEvent::ThumbWheel(delta) => {
++                let (direction, button) = if delta >= 0 {
++                    (&mut self.wheel.up, ButtonId::ThumbwheelScrollUp)
++                } else {
++                    (&mut self.wheel.down, ButtonId::ThumbwheelScrollDown)
++                };
++                if let Some(action) = profile.bindings.get(&button) {
++                    match advance(
++                        direction,
++                        action,
++                        delta.saturating_abs(),
++                        profile.sensitivity,
++                        Instant::now(),
++                    ) {
++                        WheelOutput::Idle => {}
++                        WheelOutput::Scroll(lines) => result.effects.push(Effect::Scroll(lines)),
++                        WheelOutput::FireAction => {
++                            result.effects.push(Effect::Action(action.clone()));
++                        }
++                    }
++                }
++            }
++        }
++        result
++    }
++}
++
++pub(super) fn button_id(button: u8) -> Option<ButtonId> {
++    Some(match button {
++        0 => ButtonId::LeftClick,
++        1 => ButtonId::RightClick,
++        2 => ButtonId::MiddleClick,
++        3 => ButtonId::Back,
++        4 => ButtonId::Forward,
++        5 => ButtonId::GestureButton,
++        6 => ButtonId::DpiToggle,
++        7 => ButtonId::Thumbwheel,
++        _ => return None,
++    })
++}
++
++pub(super) fn button_number(button: ButtonId) -> Option<u8> {
++    (0..=7).find(|&number| button_id(number) == Some(button))
++}
+diff --git a/crates/openlogi-agent-core/src/watchers/gesture.rs b/crates/openlogi-agent-core/src/watchers/gesture.rs
+index 36bcaa4c..2a09b2a2 100644
+--- a/crates/openlogi-agent-core/src/watchers/gesture.rs
++++ b/crates/openlogi-agent-core/src/watchers/gesture.rs
+@@ -113,10 +113,19 @@ fn thumbwheel_armed(plan: &DeviceCapturePlan) -> bool {
+ 
+ /// The [`CaptureSpec`] one device's session should run with right now.
+ fn spec_for(plan: &DeviceCapturePlan) -> CaptureSpec {
++    #[cfg(unix)]
++    let bridge = crate::remote::enabled_for(&plan.config_key);
++    #[cfg(not(unix))]
++    let bridge = false;
+     CaptureSpec {
+-        capture_thumbwheel: thumbwheel_armed(plan),
+-        divert_gesture_button: !plan.gesture_bindings.is_empty(),
+-        divert_buttons: plan.divert_buttons.clone(),
++        raw_input: bridge,
++        capture_thumbwheel: bridge || thumbwheel_armed(plan),
++        divert_gesture_button: bridge || !plan.gesture_bindings.is_empty(),
++        divert_buttons: if bridge {
++            Vec::new()
++        } else {
++            plan.divert_buttons.clone()
++        },
+     }
+ }
+ 
+@@ -360,14 +369,14 @@ fn spawn_session(
+ /// bind to independent actions, so each keeps its own running total — sharing
+ /// one would let a reversal cancel the other direction's progress.
+ #[derive(Default)]
+-struct WheelAccumulators {
+-    up: WheelDirection,
+-    down: WheelDirection,
++pub(crate) struct WheelAccumulators {
++    pub(crate) up: WheelDirection,
++    pub(crate) down: WheelDirection,
+ }
+ 
+ /// Running state for one rotation direction.
+ #[derive(Default)]
+-struct WheelDirection {
++pub(crate) struct WheelDirection {
+     /// Fractional line accumulator for continuous horizontal scroll.
+     scroll: f32,
+     /// Integer rotation-increment accumulator for a custom (non-scroll) action.
+@@ -380,7 +389,7 @@ struct WheelDirection {
+ 
+ /// What advancing a direction's accumulator should produce.
+ #[derive(Debug, PartialEq)]
+-enum WheelOutput {
++pub(crate) enum WheelOutput {
+     /// Below threshold / suppressed — emit nothing.
+     Idle,
+     /// Post this many horizontal scroll lines (signed: + right, − left).
+@@ -405,6 +414,10 @@ fn dispatch(
+     registry: &ChannelRegistry,
+     receiver_access: &ReceiverAccess,
+ ) {
++    #[cfg(unix)]
++    if crate::remote::captured(key, input) {
++        return;
++    }
+     let Ok(plans) = capture_plans.read() else {
+         return;
+     };
+@@ -413,6 +426,10 @@ fn dispatch(
+         return;
+     };
+     match input {
++        CapturedInput::RawButton { .. }
++        | CapturedInput::RawMotion { .. }
++        | CapturedInput::Ready
++        | CapturedInput::Interrupted => {}
+         CapturedInput::Gesture(direction) => {
+             if let Some(action) = plan.gesture_bindings.get(&direction) {
+                 debug!(key, ?direction, action = %action.label(), "gesture → action");
+@@ -490,7 +507,7 @@ fn dispatch(
+     reason = "magnitude/sensitivity are small integers and `lines` is a trunc'd \
+               whole number — both well within f32/i32 range"
+ )]
+-fn advance(
++pub(crate) fn advance(
+     dir: &mut WheelDirection,
+     action: &Action,
+     magnitude: i32,
+diff --git a/crates/openlogi-agent-core/tests/remote_bridge.rs b/crates/openlogi-agent-core/tests/remote_bridge.rs
+new file mode 100644
+index 00000000..010ba97a
+--- /dev/null
++++ b/crates/openlogi-agent-core/tests/remote_bridge.rs
+@@ -0,0 +1,212 @@
++//! Exercise both roles of the actual agent without opening input devices or
++//! injecting platform actions. The singleton bridge uses one integration test.
++#![cfg(target_os = "linux")]
++#![expect(clippy::unwrap_used, reason = "integration test assertions")]
++
++use std::io::{Read, Write};
++use std::os::unix::fs::PermissionsExt;
++use std::os::unix::net::UnixStream;
++use std::path::Path;
++use std::time::{Duration, Instant};
++
++use openlogi_agent_core::{orchestrator::Orchestrator, remote};
++use openlogi_core::binding::{Action, ButtonId};
++use openlogi_core::config::Config;
++use openlogi_hid::gesture::CapturedInput;
++use openlogi_hook::{EventDisposition, MouseEvent};
++use remote::wire::{MAGIC, PointerEvent};
++
++fn connect(path: &Path, role: u8) -> (UnixStream, u8) {
++    let mut stream = UnixStream::connect(path).unwrap();
++    stream
++        .set_read_timeout(Some(Duration::from_secs(2)))
++        .unwrap();
++    stream.write_all(&MAGIC).unwrap();
++    stream.write_all(&[role]).unwrap();
++    let mut ack = [0];
++    stream.read_exact(&mut ack).unwrap();
++    (stream, ack[0])
++}
++
++fn resolve(stream: &mut UnixStream, event: PointerEvent) -> u8 {
++    event.write(stream).unwrap();
++    let mut ack = [0];
++    stream.read_exact(&mut ack).unwrap();
++    ack[0]
++}
++
++fn destination_profile(socket: &Path, config: &mut Config) {
++    let (mut resolver, ack) = connect(socket, 1);
++    assert_eq!(ack, 0);
++    let down = PointerEvent::Button {
++        button: 2,
++        pressed: true,
++    };
++    let up = PointerEvent::Button {
++        button: 2,
++        pressed: false,
++    };
++    assert_eq!(
++        resolve(&mut resolver, down),
++        1,
++        "destination binding consumes the press"
++    );
++    config.set_binding("mouse", ButtonId::MiddleClick, Action::MiddleClick.into());
++    remote::publish(config, None, None);
++    assert_eq!(
++        resolve(&mut resolver, up),
++        1,
++        "a reload cannot change a held press's disposition"
++    );
++    assert_eq!(
++        resolve(&mut resolver, down),
++        0,
++        "next press sees the updated profile"
++    );
++    assert_eq!(resolve(&mut resolver, PointerEvent::Reset), 1);
++    assert_eq!(
++        resolve(&mut resolver, up),
++        1,
++        "reset forgets the cancelled hold"
++    );
++    assert_eq!(
++        resolve(&mut resolver, PointerEvent::Wheel { dx: 1, dy: -1 }),
++        0,
++        "hi-res units survive binding resolution"
++    );
++}
++
++#[cfg(target_os = "linux")]
++fn capture_records(socket: &Path) -> UnixStream {
++    let (_, ack) = connect(socket, 0);
++    assert_eq!(
++        ack, 1,
++        "capture refuses before the native hook and HID++ are ready"
++    );
++    remote::hook_ready(true);
++    assert!(remote::captured("mouse", CapturedInput::Ready));
++    let native_down = MouseEvent::Button {
++        id: ButtonId::LeftClick,
++        pressed: true,
++        device: None,
++    };
++    let native_up = MouseEvent::Button {
++        id: ButtonId::LeftClick,
++        pressed: false,
++        device: None,
++    };
++    assert!(remote::hook_input(&native_down).is_none());
++    let (_, ack) = connect(socket, 0);
++    assert_eq!(
++        ack, 1,
++        "a locally held button prevents splitting its press and release"
++    );
++    assert!(remote::hook_input(&native_up).is_none());
++    let (mut capture, ack) = connect(socket, 0);
++    assert_eq!(ack, 0);
++    let (_, ack) = connect(socket, 0);
++    assert_eq!(ack, 1, "one owner per mouse");
++    let motion = MouseEvent::Moved {
++        delta_x: 17,
++        delta_y: -3,
++    };
++    assert!(matches!(
++        remote::hook_input(&motion),
++        Some(EventDisposition::Suppress)
++    ));
++    assert_eq!(
++        PointerEvent::read(&mut capture).unwrap(),
++        PointerEvent::Motion { dx: 17, dy: -3 }
++    );
++    assert!(remote::captured(
++        "mouse",
++        CapturedInput::RawButton {
++            button: ButtonId::GestureButton,
++            pressed: true
++        }
++    ));
++    assert_eq!(
++        PointerEvent::read(&mut capture).unwrap(),
++        PointerEvent::Button {
++            button: 5,
++            pressed: true
++        }
++    );
++    assert!(remote::captured(
++        "mouse",
++        CapturedInput::RawMotion { dx: 19, dy: -23 }
++    ));
++    assert_eq!(
++        PointerEvent::read(&mut capture).unwrap(),
++        PointerEvent::GestureMotion { dx: 19, dy: -23 }
++    );
++    capture
++}
++
++#[cfg(target_os = "linux")]
++fn capture_recovery(socket: &Path, capture: UnixStream) {
++    drop(capture);
++    let motion = MouseEvent::Moved {
++        delta_x: 1,
++        delta_y: 0,
++    };
++    let deadline = Instant::now() + Duration::from_secs(2);
++    // EOF is observed independently of the input callback threads.
++    while matches!(
++        remote::hook_input(&motion),
++        Some(EventDisposition::Suppress)
++    ) {
++        assert!(Instant::now() < deadline, "EOF must restore local routing");
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    let (_, ack) = connect(socket, 0);
++    assert_eq!(
++        ack, 1,
++        "the remote-held gesture control has not been released yet"
++    );
++    assert!(remote::captured(
++        "mouse",
++        CapturedInput::RawButton {
++            button: ButtonId::GestureButton,
++            pressed: false
++        }
++    ));
++    let (capture, ack) = connect(socket, 0);
++    assert_eq!(ack, 0);
++    while matches!(
++        remote::hook_input(&motion),
++        Some(EventDisposition::Suppress)
++    ) {
++        assert!(
++            Instant::now() < deadline,
++            "a stalled client must lose its capture lease"
++        );
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    drop(capture);
++}
++
++#[test]
++fn local_socket_routes_before_bindings_and_cleans_up_leases() {
++    let directory =
++        std::env::temp_dir().join(format!("openlogi-bridge-test-{}", std::process::id()));
++    std::fs::create_dir(&directory).unwrap();
++    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
++    let socket = directory.join("pointer.sock");
++    let mut config = Config::default();
++    config.set_binding("mouse", ButtonId::MiddleClick, Action::None.into());
++    let bridge = remote::install(
++        remote::Options {
++            socket: socket.clone(),
++            device: "mouse".into(),
++        },
++        &config,
++    )
++    .unwrap();
++    let orchestrator = Orchestrator::new(config.clone());
++    bridge.serve(orchestrator.shared()).unwrap();
++    destination_profile(&socket, &mut config);
++    #[cfg(target_os = "linux")]
++    capture_recovery(&socket, capture_records(&socket));
++    std::fs::remove_dir_all(directory).unwrap();
++}
+diff --git a/crates/openlogi-agent/src/launch_agent.rs b/crates/openlogi-agent/src/launch_agent.rs
+index 6836297b..b0e00588 100644
+--- a/crates/openlogi-agent/src/launch_agent.rs
++++ b/crates/openlogi-agent/src/launch_agent.rs
+@@ -56,6 +56,9 @@ const LEGACY_LABEL: &str = "org.openlogi.openlogi";
+ /// Idempotent; failures are logged, not propagated — startup must not abort
+ /// because an autostart directory is read-only or systemd is unavailable.
+ pub fn reconcile(enabled: bool) {
++    if std::env::var_os("OPENLOGI_MANAGED_SERVICE").is_some() {
++        return;
++    }
+     #[cfg(target_os = "macos")]
+     {
+         remove_legacy();
+diff --git a/crates/openlogi-agent/src/main.rs b/crates/openlogi-agent/src/main.rs
+index 08d7aa6d..08749ceb 100644
+--- a/crates/openlogi-agent/src/main.rs
++++ b/crates/openlogi-agent/src/main.rs
+@@ -146,6 +146,39 @@ fn spawn_hidpp_watchers(shared: &SharedRuntime) {
+     );
+ }
+ 
++fn spawn_ipc(
++    orchestrator: Arc<Mutex<Orchestrator>>,
++    shared: &SharedRuntime,
++    hook_installed: Arc<AtomicBool>,
++) -> Arc<EventMonitor> {
++    let event_monitor = Arc::new(EventMonitor::default());
++    tokio::spawn(Arc::clone(&event_monitor).run_idle_janitor());
++    let server = AgentServer {
++        orchestrator,
++        shared: shared.clone(),
++        hook_installed,
++        pairing: Arc::new(pairing::PairingManager::new(shared.clone())),
++        event_monitor: Arc::clone(&event_monitor),
++    };
++    tokio::spawn(server::run(server));
++    event_monitor
++}
++
++#[cfg(unix)]
++fn init_orchestrator(config: Config) -> Option<Orchestrator> {
++    let bridge = openlogi_agent_core::remote::install_from_env(&config)
++        .inspect_err(|error| warn!(%error, "pointer bridge configuration failed; agent exiting"))
++        .ok()?;
++    let orchestrator = Orchestrator::new(config);
++    if let Some(bridge) = bridge {
++        bridge
++            .serve(orchestrator.shared())
++            .inspect_err(|error| warn!(%error, "pointer bridge startup failed; agent exiting"))
++            .ok()?;
++    }
++    Some(orchestrator)
++}
++
+ async fn run(config: Config, #[cfg(target_os = "macos")] resume_pending: Arc<AtomicBool>) {
+     // Reconcile the agent's launch-at-login autostart and clear the legacy GUI
+     // LaunchAgent, before `config` moves into the orchestrator.
+@@ -171,18 +204,22 @@ async fn run(config: Config, #[cfg(target_os = "macos")] resume_pending: Arc<Ato
+     // The orchestrator is shared with the IPC server (which serves inventory /
+     // reload / status) and mutated by the watcher select loop, so it lives
+     // behind an async mutex. Locks are brief (a map rebuild or a clone).
+-    let orchestrator = Arc::new(Mutex::new(Orchestrator::new(config)));
+-    let shared = orchestrator.lock().await.shared();
++    #[cfg(unix)]
++    let Some(orchestrator) = init_orchestrator(config) else {
++        return;
++    };
++    #[cfg(not(unix))]
++    let orchestrator = Orchestrator::new(config);
++    let shared = orchestrator.shared();
++    let orchestrator = Arc::new(Mutex::new(orchestrator));
+     let hook_installed = Arc::new(AtomicBool::new(false));
+ 
+-    // Live event monitor: shared between the hook callback (which mirrors events
+-    // into it) and the IPC server (which the GUI polls). The janitor turns it
+-    // back off once the GUI stops polling.
+-    let event_monitor = Arc::new(EventMonitor::default());
+-    tokio::spawn(Arc::clone(&event_monitor).run_idle_janitor());
+-
+-    // Pairing runs in the agent (it owns device I/O); the GUI drives it over IPC.
+-    let pairing = Arc::new(pairing::PairingManager::new(shared.clone()));
++    // The IPC server and input hook share the live event monitor.
++    let event_monitor = spawn_ipc(
++        Arc::clone(&orchestrator),
++        &shared,
++        Arc::clone(&hook_installed),
++    );
+ 
+     // HID++ watchers need no Accessibility permission — start them up front.
+     spawn_hidpp_watchers(&shared);
+@@ -195,18 +232,6 @@ async fn run(config: Config, #[cfg(target_os = "macos")] resume_pending: Arc<Ato
+     let mut app_rx = watchers::foreground_app::spawn(Duration::from_secs(1));
+     let mut accessibility_rx = watchers::accessibility::spawn(Duration::from_millis(1200));
+ 
+-    // IPC server: the GUI connects here for device state + "apply now" commands.
+-    // The endpoint (Unix socket / Windows named pipe) is resolved inside
+-    // `transport::bind`, called by `server::run`.
+-    let server = AgentServer {
+-        orchestrator: Arc::clone(&orchestrator),
+-        shared: shared.clone(),
+-        hook_installed: Arc::clone(&hook_installed),
+-        pairing: Arc::clone(&pairing),
+-        event_monitor: Arc::clone(&event_monitor),
+-    };
+-    tokio::spawn(server::run(server));
+-
+     // The CGEventTap hook is installed once Accessibility is granted and dropped
+     // if it's revoked (the tap self-disables on revoke regardless; dropping the
+     // handle stops its thread).
+@@ -263,6 +288,8 @@ async fn run(config: Config, #[cfg(target_os = "macos")] resume_pending: Arc<Ato
+                 if !granted {
+                     hook = None;
+                     hook_installed.store(false, Ordering::Relaxed);
++                    #[cfg(unix)]
++                    openlogi_agent_core::remote::hook_ready(false);
+                 }
+                 if granted && hook.is_none() {
+                     if capture_mouse_events {
+@@ -277,6 +304,8 @@ async fn run(config: Config, #[cfg(target_os = "macos")] resume_pending: Arc<Ato
+                             Arc::clone(&event_monitor),
+                         );
+                         hook_installed.store(hook.is_some(), Ordering::Relaxed);
++                        #[cfg(unix)]
++                        openlogi_agent_core::remote::hook_ready(hook.is_some());
+                     } else {
+                         info!(
+                             "OS mouse hook disabled by app_settings.capture_mouse_events — \
+diff --git a/crates/openlogi-hid/src/gesture.rs b/crates/openlogi-hid/src/gesture.rs
+index ba9d6d8c..8493a80b 100644
+--- a/crates/openlogi-hid/src/gesture.rs
++++ b/crates/openlogi-hid/src/gesture.rs
+@@ -57,6 +57,24 @@ pub enum CapturedInput {
+     /// wheel's `diverted_res` increments. Emitted while the wheel is diverted
+     /// (click bound, rotation rebound, or sensitivity changed).
+     Scroll(i16),
++    /// Diverted control state before gesture recognition or binding lookup.
++    RawButton {
++        /// Physical control identity.
++        button: ButtonId,
++        /// True while the physical control is held.
++        pressed: bool,
++    },
++    /// Dedicated gesture-control movement before gesture recognition.
++    RawMotion {
++        /// Horizontal relative movement.
++        dx: i16,
++        /// Vertical relative movement.
++        dy: i16,
++    },
++    /// All requested controls have been armed on the device.
++    Ready,
++    /// The capture session ended; pending gestures must be cancelled.
++    Interrupted,
+ }
+ 
+ /// Why a capture session could not start (or had to stop).
+@@ -102,6 +120,8 @@ pub const DIVERTABLE_STANDARD_BUTTONS: [(u16, ButtonId); 3] = [
+ /// Which of one device's controls a capture session should divert.
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ pub struct CaptureSpec {
++    /// Also emit input before gesture recognition, for pointer routing.
++    pub raw_input: bool,
+     /// Divert the thumb wheel over `0x2150` (rotation rebind / sensitivity /
+     /// click bound).
+     pub capture_thumbwheel: bool,
+@@ -156,6 +176,7 @@ pub async fn run_capture_session(
+     let thumb_index = armed.thumb.as_ref().map(|(_, idx)| *idx);
+     let dpi_set = armed.dpi_cids.clone();
+     let button_set = armed.button_cids.clone();
++    let raw_input = spec.raw_input;
+     let listener = chan.add_msg_listener_guarded({
+         let accum = Arc::clone(&accum);
+         let sink = sink.clone();
+@@ -170,6 +191,9 @@ pub async fn run_capture_session(
+                 // Recover the guard even if a prior holder panicked — the
+                 // critical section is panic-free, so the data is consistent.
+                 let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
++                if raw_input {
++                    emit_raw_controls(&acc, event, gesture_diverted, &dpi_set, &button_set, &sink);
++                }
+                 handle_reprog(
+                     &mut acc,
+                     event,
+@@ -201,7 +225,13 @@ pub async fn run_capture_session(
+         thumbwheel = armed.thumb.is_some(),
+         "control capture active"
+     );
++    if raw_input {
++        let _ = sink.send(CapturedInput::Ready);
++    }
+     let _ = shutdown.await;
++    if raw_input {
++        let _ = sink.send(CapturedInput::Interrupted);
++    }
+ 
+     drop(listener);
+     // The slot is one last-writer-wins cell shared by every session, so a
+@@ -236,6 +266,7 @@ pub async fn run_capture_session_with_stop_reason(
+         let _ = tx.send(());
+     });
+     let spec = CaptureSpec {
++        raw_input: false,
+         capture_thumbwheel,
+         divert_gesture_button,
+         divert_buttons: Vec::new(),
+@@ -442,6 +473,45 @@ pub(crate) async fn enumerate_controls(
+     Ok(controls)
+ }
+ 
++fn emit_raw_controls(
++    acc: &CaptureAccum,
++    event: RawControlEvent,
++    gesture_diverted: bool,
++    dpi_cids: &[u16],
++    button_cids: &[(u16, ButtonId)],
++    sink: &mpsc::UnboundedSender<CapturedInput>,
++) {
++    match event {
++        RawControlEvent::DivertedButtons(cids) => {
++            let controls = std::iter::once((
++                reprog_controls::GESTURE_BUTTON_CID,
++                ButtonId::GestureButton,
++                acc.swipe.is_holding(),
++            ))
++            .filter(|_| gesture_diverted)
++            .chain(
++                dpi_cids
++                    .iter()
++                    .map(|&cid| (cid, ButtonId::DpiToggle, acc.dpi_down)),
++            )
++            .chain(
++                button_cids
++                    .iter()
++                    .map(|&(cid, button)| (cid, button, acc.buttons_down.contains(&cid))),
++            );
++            for (cid, button, was_down) in controls {
++                let pressed = cids.contains(&cid);
++                if pressed != was_down {
++                    let _ = sink.send(CapturedInput::RawButton { button, pressed });
++                }
++            }
++        }
++        RawControlEvent::RawXy { dx, dy } => {
++            let _ = sink.send(CapturedInput::RawMotion { dx, dy });
++        }
++    }
++}
++
+ /// Update `acc` and emit on a decoded `0x1b04` event: commit a gesture swipe the
+ /// instant it crosses the threshold (mid-swipe, like Options+) rather than on
+ /// release, and emit a [`ButtonId::DpiToggle`] press on the rising edge of any
+diff --git a/crates/openlogi-hook/src/linux.rs b/crates/openlogi-hook/src/linux.rs
+index d05b8d63..c0dd6baf 100644
+--- a/crates/openlogi-hook/src/linux.rs
++++ b/crates/openlogi-hook/src/linux.rs
+@@ -63,7 +63,23 @@ pub(crate) struct HookInner {
+ pub(crate) fn start(
+     cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
+ ) -> Result<HookInner, HookError> {
+-    let devices = find_mouse_devices();
++    let mut devices = find_mouse_devices();
++    if std::env::var_os("OPENLOGI_BRIDGE_SOCKET").is_some() {
++        let filter = std::env::var("OPENLOGI_BRIDGE_MOUSE")
++            .unwrap_or_default()
++            .to_lowercase();
++        devices.retain(|(_, device)| {
++            !filter.is_empty()
++                && device
++                    .name()
++                    .is_some_and(|name| name.to_lowercase().contains(&filter))
++        });
++        if devices.len() != 1 {
++            return Err(HookError::Linux(io::Error::other(
++                "OPENLOGI_BRIDGE_MOUSE must select exactly one physical Logitech mouse",
++            )));
++        }
++    }
+     if devices.is_empty() {
+         return Err(HookError::NoDeviceFound);
+     }
+@@ -490,6 +506,7 @@ fn device_thread(
+         }
+     }
+ 
++    cb(HookEvent::Mouse(MouseEvent::CaptureInterrupted));
+     debug!("hook stopped on {}", path.display());
+     // Dropping `device` releases the exclusive grab, restoring normal input delivery.
+ }

@@ -1,6 +1,6 @@
 # hidpipe
 
-Cross-machine HID event pipe: capture on Linux, inject on macOS. The wire carries HID usage IDs and nothing else.
+Cross-machine input pipe: capture on Linux, inject on macOS. Keyboard frames carry HID usage IDs. The optional OpenLogi backend forwards mouse input before bindings are resolved, so each machine can keep its own mouse configuration.
 
 It fixes three structural problems of the deskflow/synergy family:
 
@@ -28,7 +28,7 @@ flowchart LR
 Three design invariants:
 
 1. The protocol has no semantics. Only raw HID events go on the wire. No keymap negotiation, no modifier state machine, no cache. Nothing that can drift.
-2. Remapping happens exactly once, at a fixed place. All remapping is done by keyd on the capture side, which resolves stateful remaps like `overload(control, esc)` before events go on the wire. Injection on macOS happens at the Quartz layer, below Karabiner's driver, so injected events are never remapped twice and the Mac side needs no configuration.
+2. Keyboard remapping happens exactly once, at a fixed place. keyd on the capture side resolves stateful remaps like `overload(control, esc)` before keyboard events go on the wire. Quartz injection bypasses driver-level keyboard remapping. With the OpenLogi backend, mouse bindings are resolved exactly once on the machine currently being controlled.
 3. Disconnect releases everything. When the connection dies, the server ungrabs at once and the client releases all held keys on Drop. Grab and key state live and die with the connection.
 
 ## Build
@@ -155,6 +155,86 @@ Check the Linux service with `systemctl --user status hidpipe` and
 `journalctl --user -u hidpipe -f`. On macOS, use
 `launchctl print gui/$(id -u)/org.nix-community.home.hidpipe`.
 
+## OpenLogi mouse backend
+
+Enable this backend on **both** peers to use macOS's own OpenLogi bindings instead
+of forwarding Linux-generated shortcuts. The bridge patch targets OpenLogi
+**0.6.25**; `nix/openlogi-package.nix` applies it without changing dependencies.
+The protocol module in `proto/src/pointer.rs` is compiled into both programs.
+The editable OpenLogi worktree can link that file at
+`crates/openlogi-agent-core/src/remote/wire.rs`.
+
+On NixOS:
+
+```nix
+services.hidpipe = {
+  enable = true;
+  user = "alice";
+  openFirewall = true;
+  openlogi = {
+    enable = true;
+    mouse = "MX Master 2S";
+    # device = "<OpenLogi config key>"; # required for multiple configured mice
+  };
+};
+```
+
+Disable logiops and other services that capture or divert the same mouse. The
+module provides the patched OpenLogi GUI and agent, grants the user `input` and
+`uinput` membership, and enables `/dev/uinput`. Log out and back in after changing
+groups. OpenLogi owns the physical mouse for the entire session; hidpipe only grabs
+the keyd keyboard when entering remote mode.
+
+On macOS with Home Manager:
+
+```nix
+services.hidpipe = {
+  enable = true;
+  host = "linux-host.local";
+  openlogi.enable = true;
+  # openlogi.device = "<Mac OpenLogi config key>";
+};
+```
+
+Use the OpenLogi GUI on each machine to configure that machine's actions. The Mac
+agent uses its saved device selection unless `openlogi.device` is explicit; the
+mouse need not be physically connected to the Mac. Linux automatically chooses
+its first online pointing device unless a key is explicit. With multiple mice,
+set the key explicitly on both peers. Device keys and bindings do not have to
+match across systems. Quit any previously running OpenLogi agent once when
+migrating to the managed service, and remove its old login item. Grant the patched
+`openlogi-agent` and `hidpipe-client` Accessibility access on macOS.
+
+The module manages `openlogi-agent.service` on Linux and a launchd agent on macOS.
+Logs on the Mac are in `~/Library/Logs/openlogi-agent.log`. Socket paths default to
+`~/.cache/openlogi-hidpipe/pointer.sock` and must be in a private directory (0700).
+The agent uses `OPENLOGI_MANAGED_SERVICE=1` to leave autostart management to Nix.
+Override `openlogi.basePackage` when using another nixpkgs input:
+
+```nix
+services.hidpipe.openlogi.basePackage = fastest-pkg.openlogi;
+```
+
+For manual operation, give the agent `OPENLOGI_BRIDGE_SOCKET` and optionally
+`OPENLOGI_BRIDGE_DEVICE`; on Linux also give it `OPENLOGI_BRIDGE_MOUSE` (a name
+substring selecting exactly one physical Logitech mouse). Pass
+`--openlogi-socket <path>` to hidpipe on each machine. The agent's socket is
+local-only and versioned independently of GUI IPC.
+
+Capture is a connection-scoped lease with a 750 ms heartbeat deadline. A held
+mouse button prevents entry. Disconnect, a stalled server, input-hook failure,
+or a full capture queue revokes the lease and restores Linux routing. Buttons
+still held at revocation are quarantined until release; pending gestures are
+cancelled without firing a click. On macOS, binding lookup happens before normal
+mouse injection, and a held button keeps its original disposition across config
+or foreground-app changes. Sub-notch wheel motion is retained. Hardware settings
+such as DPI and SmartShift belong to the Linux profile; this bridge does not
+forward hardware actions from the Mac back to the physical device.
+
+The network protocol is version 1. Upgrade both hidpipe peers together; a
+version or pointer-backend mismatch is rejected before capture. Native evdev
+capture remains available when OpenLogi is disabled.
+
 ## Run
 
 Linux needs a Wayland session with layer-shell support and read access to
@@ -197,7 +277,7 @@ Switching works like this. Push the cursor past the right edge of the Linux scre
 - The barrier sits on the right edge of every output. With multiple monitors, the seam between two outputs triggers it too. Per-output configuration is on the roadmap.
 - The return direction (Mac to Linux) only watches the left edge of the Mac's main display.
 - Hot-plug is not handled. A failed read falls back to local mode and logs; restart the server to recover.
-- Side mouse buttons (back, forward) are not forwarded.
+- Side mouse buttons (back, forward) are forwarded with the OpenLogi backend; native evdev capture still forwards three buttons.
 
 ## Roadmap
 

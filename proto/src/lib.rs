@@ -14,15 +14,22 @@
 
 use std::io::{self, Read, Write};
 
+#[cfg(unix)]
+pub mod bridge;
+pub mod pointer;
+pub use pointer::PointerEvent;
+
 /// Protocol version, carried in the handshake. A mismatch is rejected
 /// instead of silently misinterpreting frames.
-pub const VERSION: u8 = 0;
+pub const VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame {
     /// First frame a client sends after connecting.
     Hello {
         version: u8,
+        /// Both peers must select the same pointer backend.
+        openlogi: bool,
     },
     /// Keyboard event. usage is a USB HID page 0x07 usage ID.
     Key {
@@ -55,6 +62,8 @@ pub enum Frame {
     /// ReleaseAll: one is the server taking control back, the other is the
     /// user on the client side expressing intent deterministically.
     ReturnToLocal,
+    /// Raw OpenLogi pointer input, resolved by the destination's own profile.
+    Pointer(PointerEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +82,8 @@ pub enum MouseButton {
     Left = 0,
     Right = 1,
     Middle = 2,
+    Back = 3,
+    Forward = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,15 +102,17 @@ const TAG_RELEASE_ALL: u8 = 0x05;
 const TAG_PING: u8 = 0x06;
 const TAG_PONG: u8 = 0x07;
 const TAG_RETURN_TO_LOCAL: u8 = 0x08;
+const TAG_POINTER: u8 = 0x09;
 
 /// Fixed payload length per tag; None for unknown tags.
 pub const fn payload_len(tag: u8) -> Option<usize> {
     match tag {
-        TAG_HELLO => Some(1),
+        TAG_HELLO => Some(2),
         TAG_KEY => Some(3),
         TAG_MOTION => Some(4),
         TAG_BUTTON | TAG_WHEEL => Some(2),
         TAG_RELEASE_ALL | TAG_PING | TAG_PONG | TAG_RETURN_TO_LOCAL => Some(0),
+        TAG_POINTER => Some(pointer::RECORD_SIZE),
         _ => None,
     }
 }
@@ -107,7 +120,7 @@ pub const fn payload_len(tag: u8) -> Option<usize> {
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity(5);
     match *frame {
-        Frame::Hello { version } => out.extend([TAG_HELLO, version]),
+        Frame::Hello { version, openlogi } => out.extend([TAG_HELLO, version, u8::from(openlogi)]),
         Frame::Key { usage, state } => {
             out.push(TAG_KEY);
             out.extend(usage.to_be_bytes());
@@ -124,6 +137,10 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         Frame::Ping => out.push(TAG_PING),
         Frame::Pong => out.push(TAG_PONG),
         Frame::ReturnToLocal => out.push(TAG_RETURN_TO_LOCAL),
+        Frame::Pointer(event) => {
+            out.push(TAG_POINTER);
+            out.extend(event.encode());
+        }
     }
     out
 }
@@ -135,6 +152,11 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<Frame> {
     Some(match tag {
         TAG_HELLO => Frame::Hello {
             version: payload[0],
+            openlogi: match payload[1] {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
         },
         TAG_KEY => Frame::Key {
             usage: u16::from_be_bytes([payload[0], payload[1]]),
@@ -152,7 +174,10 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<Frame> {
             button: match payload[0] {
                 0 => MouseButton::Left,
                 1 => MouseButton::Right,
-                _ => MouseButton::Middle,
+                2 => MouseButton::Middle,
+                3 => MouseButton::Back,
+                4 => MouseButton::Forward,
+                _ => return None,
             },
             state: match payload[1] {
                 1 => ButtonState::Press,
@@ -167,6 +192,7 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<Frame> {
         TAG_PING => Frame::Ping,
         TAG_PONG => Frame::Pong,
         TAG_RETURN_TO_LOCAL => Frame::ReturnToLocal,
+        TAG_POINTER => Frame::Pointer(PointerEvent::decode(payload.try_into().ok()?).ok()?),
         _ => return None,
     })
 }
@@ -181,7 +207,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
     let mut tag = [0u8; 1];
     r.read_exact(&mut tag)?;
     let len = payload_len(tag[0]).ok_or(invalid("unknown frame tag"))?;
-    let mut payload = [0u8; 8];
+    let mut payload = [0u8; pointer::RECORD_SIZE];
     r.read_exact(&mut payload[..len])?;
     decode(tag[0], &payload[..len]).ok_or(invalid("malformed frame"))
 }

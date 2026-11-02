@@ -43,7 +43,7 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 
 use hidpipe_proto as proto;
-use proto::{ButtonState, Frame, KeyState, MouseButton};
+use proto::{bridge::Resolver, ButtonState, Frame, KeyState, MouseButton, PointerEvent};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -103,6 +103,11 @@ fn main() {
 }
 
 fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
+    let mut resolver = args
+        .openlogi_socket
+        .as_ref()
+        .map(|path| Resolver::connect(path))
+        .transpose()?;
     let mut stream = TcpStream::connect((args.host.as_str(), args.port))?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -110,6 +115,7 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
         &mut stream,
         &Frame::Hello {
             version: proto::VERSION,
+            openlogi: resolver.is_some(),
         },
     )?;
     log!("connected to {}:{}", args.host, args.port);
@@ -119,6 +125,22 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
         let frame = proto::read_frame(&mut stream)?;
         match frame {
             Frame::Ping => proto::write_frame(&mut stream, &Frame::Pong)?,
+            Frame::Pointer(event) => {
+                let resolver = resolver
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("server requires an OpenLogi bridge"))?;
+                if resolver.resolve(event)? {
+                    if let Some(back) = injector.pointer(event) {
+                        proto::write_frame(&mut stream, &back)?;
+                    }
+                }
+            }
+            Frame::ReleaseAll => {
+                injector.release_all();
+                if let Some(resolver) = resolver.as_mut() {
+                    resolver.resolve(PointerEvent::Reset)?;
+                }
+            }
             frame => {
                 if let Some(back) = injector.handle(frame) {
                     proto::write_frame(&mut stream, &back)?;
@@ -151,6 +173,7 @@ struct Injector {
     /// Time window of leftward pushes while the cursor is clamped at the
     /// left edge, (timestamp, displacement).
     edge_pushes: VecDeque<(Instant, i32)>,
+    wheel_remainder: (i32, i32),
 }
 
 impl Injector {
@@ -170,6 +193,7 @@ impl Injector {
             flip_scroll,
             cursor,
             edge_pushes: VecDeque::new(),
+            wheel_remainder: (0, 0),
         }
     }
 
@@ -178,7 +202,7 @@ impl Injector {
     fn handle(&mut self, frame: Frame) -> Option<Frame> {
         match frame {
             Frame::Key { usage, state } => self.key(usage, state),
-            Frame::Motion { dx, dy } => return self.motion(dx, dy),
+            Frame::Motion { dx, dy } => return self.motion(i32::from(dx), i32::from(dy)),
             Frame::Button { button, state } => self.button(button, state),
             Frame::Wheel { dx, dy } => self.wheel(dx, dy),
             Frame::ReleaseAll => self.release_all(),
@@ -234,7 +258,53 @@ impl Injector {
         }
     }
 
-    fn motion(&mut self, dx: i16, dy: i16) -> Option<Frame> {
+    fn pointer(&mut self, event: PointerEvent) -> Option<Frame> {
+        match event {
+            PointerEvent::Motion { dx, dy } => return self.motion(dx, dy),
+            PointerEvent::Button { button, pressed } => {
+                let button = match button {
+                    0 => MouseButton::Left,
+                    1 => MouseButton::Right,
+                    2 => MouseButton::Middle,
+                    3 => MouseButton::Back,
+                    4 => MouseButton::Forward,
+                    _ => return None,
+                };
+                self.button(
+                    button,
+                    if pressed {
+                        ButtonState::Press
+                    } else {
+                        ButtonState::Release
+                    },
+                );
+            }
+            PointerEvent::Wheel { dx, dy } => {
+                // Preserve sub-pixel high-resolution deltas across reports.
+                // A notch is 120 units, rendered as 30 pixels on macOS.
+                self.wheel_remainder.0 = self.wheel_remainder.0.saturating_add(dx);
+                self.wheel_remainder.1 = self.wheel_remainder.1.saturating_add(dy);
+                let (x, y) = (self.wheel_remainder.0 / 4, self.wheel_remainder.1 / 4);
+                self.wheel_remainder.0 %= 4;
+                self.wheel_remainder.1 %= 4;
+                let sign = if self.flip_scroll { -1 } else { 1 };
+                if x != 0 || y != 0 {
+                    self.scroll_units(
+                        ScrollEventUnit::PIXEL,
+                        2,
+                        y.saturating_mul(sign),
+                        x.saturating_mul(sign),
+                        0,
+                    );
+                }
+            }
+            PointerEvent::Reset => self.release_all(),
+            _ => {}
+        }
+        None
+    }
+
+    fn motion(&mut self, dx: i32, dy: i32) -> Option<Frame> {
         // v0 clamps to the main display only; multi-monitor is on the
         // roadmap.
         let b = CGDisplay::main().bounds();
@@ -252,7 +322,9 @@ impl Injector {
         let event_type = held_button.map_or(CGEventType::MouseMoved, |button| match button {
             MouseButton::Left => CGEventType::LeftMouseDragged,
             MouseButton::Right => CGEventType::RightMouseDragged,
-            MouseButton::Middle => CGEventType::OtherMouseDragged,
+            MouseButton::Middle | MouseButton::Back | MouseButton::Forward => {
+                CGEventType::OtherMouseDragged
+            }
         });
         let Ok(event) = CGEvent::new_mouse_event(
             self.source.clone(),
@@ -266,6 +338,10 @@ impl Injector {
         // fields, not the absolute position.
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+        event.set_integer_value_field(
+            EventField::MOUSE_EVENT_BUTTON_NUMBER,
+            held_button.map_or(0, |button| button as i64),
+        );
         event.set_flags(mods);
         event.post(CGEventTapLocation::HID);
 
@@ -277,7 +353,8 @@ impl Injector {
         let pinned = self.cursor.x <= b.origin.x && held_button.is_none();
         if pinned {
             if dx < 0 {
-                self.edge_pushes.push_back((Instant::now(), i32::from(-dx)));
+                self.edge_pushes
+                    .push_back((Instant::now(), dx.saturating_neg()));
             }
             while self
                 .edge_pushes
@@ -286,7 +363,10 @@ impl Injector {
             {
                 self.edge_pushes.pop_front();
             }
-            let pushed: i32 = self.edge_pushes.iter().map(|(_, v)| v).sum();
+            let pushed = self
+                .edge_pushes
+                .iter()
+                .fold(0i32, |sum, (_, v)| sum.saturating_add(*v));
             if pushed > RETURN_PUSH_THRESHOLD {
                 self.edge_pushes.clear();
                 log!("cursor pushed through the left edge, handing control back");
@@ -325,14 +405,13 @@ impl Injector {
     }
 
     fn scroll(&self, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
-        let Ok(event) = CGEvent::new_scroll_event(
-            self.source.clone(),
-            ScrollEventUnit::LINE,
-            wheel_count,
-            w1,
-            w2,
-            w3,
-        ) else {
+        self.scroll_units(ScrollEventUnit::LINE, wheel_count, w1, w2, w3);
+    }
+
+    fn scroll_units(&self, units: ScrollEventUnit, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
+        let Ok(event) =
+            CGEvent::new_scroll_event(self.source.clone(), units, wheel_count, w1, w2, w3)
+        else {
             return;
         };
         event.set_flags(self.pressed.lock().unwrap().mods);
@@ -340,6 +419,8 @@ impl Injector {
     }
 
     fn release_all(&mut self) {
+        self.edge_pushes.clear();
+        self.wheel_remainder = (0, 0);
         release_all(&self.source, &mut self.pressed.lock().unwrap());
     }
 }
@@ -434,11 +515,18 @@ fn post_button(
         (MouseButton::Middle, ButtonState::Release) => {
             (CGEventType::OtherMouseUp, CGMouseButton::Center)
         }
+        (MouseButton::Back | MouseButton::Forward, ButtonState::Press) => {
+            (CGEventType::OtherMouseDown, CGMouseButton::Center)
+        }
+        (MouseButton::Back | MouseButton::Forward, ButtonState::Release) => {
+            (CGEventType::OtherMouseUp, CGMouseButton::Center)
+        }
     };
     let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, position, cg_button)
     else {
         return;
     };
+    event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
 }
@@ -454,6 +542,7 @@ struct Args {
     /// not affect synthetic events; if scrolling comes out reversed, use
     /// this switch.
     flip_scroll: bool,
+    openlogi_socket: Option<std::path::PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -463,6 +552,7 @@ Usage: hidpipe-client <server-address> [options]
 
 Options:
   --port <port>   server port (default 24800)
+  --openlogi-socket <path>  resolve mouse input with the local OpenLogi agent
   --flip-scroll   reverse scroll direction
   -h, --help      show this help
 
@@ -475,6 +565,7 @@ impl Args {
             host: String::new(),
             port: 24800,
             flip_scroll: false,
+            openlogi_socket: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -488,6 +579,16 @@ impl Args {
                         eprintln!("--port is not a valid port number\n{USAGE}");
                         std::process::exit(2);
                     });
+                }
+                "--openlogi-socket" => {
+                    args.openlogi_socket = Some(
+                        it.next()
+                            .unwrap_or_else(|| {
+                                eprintln!("--openlogi-socket requires a path\n{USAGE}");
+                                std::process::exit(2);
+                            })
+                            .into(),
+                    );
                 }
                 "--flip-scroll" => args.flip_scroll = true,
                 "-h" | "--help" => {

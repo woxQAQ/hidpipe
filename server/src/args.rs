@@ -7,6 +7,7 @@ pub struct Args {
     /// Device name substring filter; None means auto-detect.
     pub keyboard: Option<String>,
     pub mouse: Option<String>,
+    pub openlogi_socket: Option<std::path::PathBuf>,
     /// Swap caps and esc on the capture side; only affects keys sent to the
     /// remote. When the swap lives in the xkb layer (above evdev), the
     /// remote side never sees it, so this flag redoes it. Do not enable it
@@ -24,6 +25,7 @@ Options:
   --port <port>        listen port (default 24800)
   --keyboard <substr>  match keyboard device name (default auto-detect, prefers the keyd virtual keyboard)
   --mouse <substr>     match mouse device name (default auto-detect)
+  --openlogi-socket <path>  capture the mouse through an OpenLogi bridge
   --swap-caps-esc      swap caps and esc for keys sent to the remote
   -h, --help           show this help
 
@@ -38,6 +40,7 @@ impl Args {
             port: 24800,
             keyboard: None,
             mouse: None,
+            openlogi_socket: None,
             swap_caps_esc: false,
         };
         let mut it = std::env::args().skip(1);
@@ -58,6 +61,9 @@ impl Args {
                 }
                 "--keyboard" => args.keyboard = Some(take("--keyboard")),
                 "--mouse" => args.mouse = Some(take("--mouse")),
+                "--openlogi-socket" => {
+                    args.openlogi_socket = Some(take("--openlogi-socket").into())
+                }
                 "--swap-caps-esc" => args.swap_caps_esc = true,
                 "-h" | "--help" => {
                     print!("{USAGE}");
@@ -68,6 +74,10 @@ impl Args {
                     std::process::exit(2);
                 }
             }
+        }
+        if args.openlogi_socket.is_some() && args.mouse.is_some() {
+            eprintln!("--mouse and --openlogi-socket are mutually exclusive");
+            std::process::exit(2);
         }
         args
     }

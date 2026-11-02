@@ -6,8 +6,14 @@ use hidpipe_proto::{decode, encode, payload_len, ButtonState, Frame, KeyState, M
 
 fn cases() -> Vec<Frame> {
     vec![
-        Frame::Hello { version: 0 },
-        Frame::Hello { version: 255 },
+        Frame::Hello {
+            version: 0,
+            openlogi: false,
+        },
+        Frame::Hello {
+            version: 255,
+            openlogi: true,
+        },
         Frame::Key {
             usage: 0x04,
             state: KeyState::Press,
