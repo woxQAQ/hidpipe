@@ -29,34 +29,53 @@ pub enum NetMsg {
     Dead(u64),
 }
 
+struct QueuedFrame {
+    frame: Frame,
+    queued_at: Option<Instant>,
+}
+
 pub struct Connection {
     pub id: u64,
-    tx: Sender<Frame>,
+    tx: Sender<QueuedFrame>,
+    latency_stats: bool,
     shutdown: TcpStream,
 }
 
 impl Connection {
-    pub fn spawn(stream: TcpStream, net_tx: Sender<NetMsg>, id: u64) -> io::Result<Self> {
+    pub fn spawn(
+        stream: TcpStream,
+        net_tx: Sender<NetMsg>,
+        id: u64,
+        latency_stats: bool,
+    ) -> io::Result<Self> {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         let reader = stream.try_clone()?;
         let shutdown = stream.try_clone()?;
-        let (tx, rx) = mpsc::channel::<Frame>();
+        let (tx, rx) = mpsc::channel::<QueuedFrame>();
         thread::spawn({
             let net_tx = net_tx.clone();
-            move || writer_loop(stream, rx, net_tx, id)
+            move || writer_loop(stream, rx, net_tx, id, latency_stats)
         });
         thread::spawn({
             let tx = tx.clone();
             move || reader_loop(reader, tx, net_tx, id)
         });
-        Ok(Self { id, tx, shutdown })
+        Ok(Self {
+            id,
+            tx,
+            latency_stats,
+            shutdown,
+        })
     }
 
     /// A failed send means the peer is dead; the read/write threads report
     /// Dead shortly after, so the frame is dropped silently here.
     pub fn send(&self, frame: Frame) {
-        let _ = self.tx.send(frame);
+        let _ = self.tx.send(QueuedFrame {
+            frame,
+            queued_at: self.latency_stats.then(Instant::now),
+        });
     }
 }
 
@@ -66,7 +85,15 @@ impl Drop for Connection {
     }
 }
 
-fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg>, id: u64) {
+fn writer_loop(
+    mut stream: TcpStream,
+    rx: Receiver<QueuedFrame>,
+    net_tx: Sender<NetMsg>,
+    id: u64,
+    latency_stats: bool,
+) {
+    let mut stats =
+        latency_stats.then(|| proto::latency::LatencyStats::new(["server.queue", "server.write"]));
     // Pings must go out on schedule, independent of data traffic. If we
     // only pinged after 2s of channel idle, constant mouse motion would
     // starve Ping forever: the peer would never see a Ping, never answer
@@ -75,7 +102,12 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg
     let mut next_ping = Instant::now() + PING_INTERVAL;
     loop {
         let frame = match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
-            Ok(frame) => frame,
+            Ok(queued) => {
+                if let (Some(stats), Some(started)) = (stats.as_mut(), queued.queued_at) {
+                    stats.record(0, started.elapsed());
+                }
+                queued.frame
+            }
             Err(RecvTimeoutError::Timeout) => Frame::Ping,
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -85,14 +117,20 @@ fn writer_loop(mut stream: TcpStream, rx: Receiver<Frame>, net_tx: Sender<NetMsg
         if matches!(frame, Frame::Ping) {
             next_ping = Instant::now() + PING_INTERVAL;
         }
-        if proto::write_frame(&mut stream, &frame).is_err() {
+        let started = stats.as_ref().map(|_| Instant::now());
+        let result = proto::write_frame(&mut stream, &frame);
+        if let (Some(stats), Some(started)) = (stats.as_mut(), started) {
+            stats.record(1, started.elapsed());
+            stats.report_if_due();
+        }
+        if result.is_err() {
             let _ = net_tx.send(NetMsg::Dead(id));
             return;
         }
     }
 }
 
-fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>, id: u64) {
+fn reader_loop(mut stream: TcpStream, tx: Sender<QueuedFrame>, net_tx: Sender<NetMsg>, id: u64) {
     // The first frame must be a version-matching Hello, otherwise the
     // connection is declared dead at once. A connection that fails the
     // handshake must not displace the serving one. This is admission
@@ -111,7 +149,10 @@ fn reader_loop(mut stream: TcpStream, tx: Sender<Frame>, net_tx: Sender<NetMsg>,
     loop {
         match proto::read_frame(&mut stream) {
             Ok(Frame::Ping) => {
-                let _ = tx.send(Frame::Pong);
+                let _ = tx.send(QueuedFrame {
+                    frame: Frame::Pong,
+                    queued_at: None,
+                });
             }
             Ok(Frame::ReturnToLocal) => {
                 let _ = net_tx.send(NetMsg::ReturnToLocal(id));

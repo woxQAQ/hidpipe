@@ -13,6 +13,7 @@ pub struct Args {
     /// remote side never sees it, so this flag redoes it. Do not enable it
     /// if keyd or udev already does the swap.
     pub swap_caps_esc: bool,
+    pub latency_stats: bool,
 }
 
 const USAGE: &str = "\
@@ -27,6 +28,7 @@ Options:
   --mouse <substr>     match mouse device name (default auto-detect)
   --openlogi-socket <path>  capture the mouse through an OpenLogi bridge
   --swap-caps-esc      swap caps and esc for keys sent to the remote
+  --latency-stats      log local timing summaries every 5 seconds
   -h, --help           show this help
 
 Needs read access to /dev/input/event* (input group or root).
@@ -42,6 +44,7 @@ impl Args {
             mouse: None,
             openlogi_socket: None,
             swap_caps_esc: false,
+            latency_stats: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -64,6 +67,7 @@ impl Args {
                 "--openlogi-socket" => {
                     args.openlogi_socket = Some(take("--openlogi-socket").into())
                 }
+                "--latency-stats" => args.latency_stats = true,
                 "--swap-caps-esc" => args.swap_caps_esc = true,
                 "-h" | "--help" => {
                     print!("{USAGE}");

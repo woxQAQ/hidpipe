@@ -323,6 +323,109 @@ Switching works like this. Push the cursor past the right edge of the Linux scre
 | `--flip-scroll` | off | reverse scroll direction |
 | `--scroll-pixels-per-notch` | 15 | OpenLogi scroll distance per notch, on both axes (1–65535) |
 
+## Latency diagnostics
+
+Enable `services.hidpipe.latencyStats = true;` on both machines to log local
+stage counts, mean durations, and maximum durations every five seconds while
+connected. Manual runs accept `--latency-stats` on both executables. Remaining
+samples are reported when the session ends normally or returns an error.
+Diagnostics are disabled by default and never log key codes or pointer contents.
+
+The Linux log reports `server.queue` (enqueue to writer dequeue) and
+`server.write` (serialization and socket write). The Mac log reports
+`client.resolve` (OpenLogi request/reply), `client.inject` (input handling,
+including Quartz calls), `client.feedback` (optional reply write), and
+`client.process` (processing a received frame, excluding the blocking read).
+Each row contains its sample count `n`, `mean_us`, and `max_us`. Stages have
+independent counts: consumed OpenLogi events do not produce injection samples.
+These are local durations, not end-to-end input or application display latency.
+`server.queue` starts after capture, so it does not include the Linux capture
+loop's polling delay. A completed write or CGEventPost call does not mean the
+peer or application has processed the input.
+
+For a comparison with Deskflow's delayed-ACK workaround, enable this option on
+the **Mac**, leaving latency statistics enabled on both peers:
+
+```nix
+services.hidpipe = {
+  latencyStats = true;
+  inputFeedback = true;
+};
+```
+
+The equivalent client flag is `--input-feedback`. It sends one existing Pong
+frame per input frame, before local resolution or injection. Ping retains its
+normal reply and Pong is never echoed. This needs no protocol version change
+and works with an existing server. The option defaults to `false` pending
+measurements and adds a reply packet per input frame with TCP_NODELAY enabled.
+The server side of the new diagnostics requires the updated server package.
+
+Compare the same movement, typing, and scrolling with `inputFeedback` off and
+on; keep the mouse configuration and network unchanged. Compare perceived
+responsiveness and TCP RTT/retransmissions as well as local timing summaries:
+a network improvement need not change the local stage timings. Avoid inferring
+macOS ACK timing from Linux's receive-side `ato` value. See
+[the Deskflow source investigation](diag/deskflow-latency.md) for evidence and
+remaining optimization constraints.
+
+## Scroll diagnostics (Linux)
+
+Build the passive evdev listener using the server's existing dependencies:
+
+```sh
+cargo build -p hidpipe-server --example scroll
+sudo target/debug/examples/scroll --list
+sudo target/debug/examples/scroll /dev/input/eventN | tee /tmp/hidpipe-scroll-linux.log
+```
+
+Replace `eventN` with a wheel device from `--list`. Root is only needed when
+input-device permissions require it. The listener never grabs the device or
+injects input. Stop with Ctrl-C.
+
+Each line is a wheel-containing `SYN_REPORT` frame, with elapsed time, the kernel
+event timestamp, the interval since the previous wheel frame (`dt`), and the
+original wheel events in their original order. `REL_WHEEL` is vertical and
+`REL_HWHEEL` horizontal; their `HI_RES` variants use 120 units per notch.
+Ordinary and high-resolution events describe the same movement in different
+units, so do not add them together. `SYN_DROPPED` warns that events were lost.
+
+Use the physical mouse to inspect hardware input and the OpenLogi virtual mouse
+to inspect forwarded local input, in separate terminals if needed. An exclusive
+grab by OpenLogi or hidpipe can make the physical device silent to this listener;
+stop the capturing service if a physical-device recording is needed. Diverted
+thumb-wheel input handled through HID++ may not appear in physical evdev events.
+This tool observes evdev, before libinput or application scroll processing.
+
+Record five slow upward notches, pause, then five downward notches. Also try a
+light touch, the horizontal wheel, and a fast spin to inspect unexpected events
+or direction reversals.
+
+## Scroll diagnostics (macOS)
+
+Run the passive scroll listener on the Mac alongside `hidpipe-client`:
+
+```sh
+swift diag/scroll.swift | tee /tmp/hidpipe-scroll.log
+```
+
+Grant the terminal Input Monitoring / Accessibility access if tap creation fails.
+The listener observes the HID event tap where hidpipe injects events, without
+changing or consuming them. Stop with Ctrl-C.
+
+Each event reports its arrival interval (`dt`), event timestamp, `(x,y)` deltas
+in integer lines (`line`), pixels (`point`), and fractional lines (`fixed`), plus
+continuous-scroll, scroll-phase, momentum-phase, source PID, and modifier fields.
+Source PID can help distinguish hidpipe from other injectors; PID 0 may represent
+system or hardware events and does not identify a particular physical device.
+These are macOS events after injection, not raw Linux evdev reports or measured
+application scroll distances.
+
+For a useful comparison, record five slow upward notches, pause, then five
+downward notches in remote mode. Also try the horizontal wheel and a fast spin.
+Repeat with a mouse connected directly to the Mac. Keep the same foreground app
+and note which capture used hidpipe; compare event spacing, delta sizes, signs,
+and any unexpected events after the wheel stops.
+
 ## Known limitations (v0, weekend prototype)
 
 - Plain TCP, trusted LANs only. TLS is on the roadmap.

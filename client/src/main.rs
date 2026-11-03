@@ -28,6 +28,7 @@
 #[allow(unsafe_code)]
 mod event_access;
 mod table;
+mod transport;
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -132,6 +133,7 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     let mut stream = TcpStream::connect((args.host.as_str(), args.port))?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(READ_TIMEOUT))?;
     proto::write_frame(
         &mut stream,
         &Frame::Hello {
@@ -141,42 +143,20 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
     )?;
     log!("connected to {}:{}", args.host, args.port);
 
+    log!(
+        "input feedback: {}; latency stats: {}",
+        args.input_feedback,
+        args.latency_stats
+    );
     let mut injector = Injector::new(args.flip_scroll, args.scroll_pixels_per_notch, pressed);
-    loop {
-        let frame = proto::read_frame(&mut stream)?;
-        match frame {
-            Frame::Ping => {
-                if !event_access::is_allowed() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "macOS input injection access was revoked",
-                    ));
-                }
-                proto::write_frame(&mut stream, &Frame::Pong)?;
-            }
-            Frame::Pointer(event) => {
-                let resolver = resolver
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("server requires an OpenLogi bridge"))?;
-                if resolver.resolve(event)? {
-                    if let Some(back) = injector.pointer(event) {
-                        proto::write_frame(&mut stream, &back)?;
-                    }
-                }
-            }
-            Frame::ReleaseAll => {
-                injector.release_all();
-                if let Some(resolver) = resolver.as_mut() {
-                    resolver.resolve(PointerEvent::Reset)?;
-                }
-            }
-            frame => {
-                if let Some(back) = injector.handle(frame) {
-                    proto::write_frame(&mut stream, &back)?;
-                }
-            }
-        }
-    }
+    transport::run(
+        &mut stream,
+        resolver.as_mut(),
+        args.input_feedback,
+        args.latency_stats,
+        |frame| injector.handle(frame),
+        event_access::is_allowed,
+    )
 }
 
 /// The currently held keys, buttons and modifier bitmask. Plain data,
@@ -237,6 +217,7 @@ impl Injector {
     fn handle(&mut self, frame: Frame) -> Option<Frame> {
         match frame {
             Frame::Key { usage, state } => self.key(usage, state),
+            Frame::Pointer(event) => return self.pointer(event),
             Frame::Motion { dx, dy } => return self.motion(i32::from(dx), i32::from(dy)),
             Frame::Button { button, state } => self.button(button, state),
             Frame::Wheel { dx, dy } => self.wheel(dx, dy),
@@ -579,6 +560,8 @@ fn current_location(source: &CGEventSource) -> Option<CGPoint> {
 struct Args {
     host: String,
     port: u16,
+    input_feedback: bool,
+    latency_stats: bool,
     /// Reverse scroll direction. macOS's natural scrolling setting does
     /// not affect synthetic events; if scrolling comes out reversed, use
     /// this switch.
@@ -596,6 +579,8 @@ Usage: hidpipe-client <server-address> [options]
 Options:
   --port <port>   server port (default 24800)
   --openlogi-socket <path>  resolve mouse input with the local OpenLogi agent
+  --input-feedback  reply to every input frame to mitigate TCP delayed ACK
+  --latency-stats   log local timing summaries every 5 seconds
   --flip-scroll   reverse scroll direction
   --scroll-pixels-per-notch <pixels>  OpenLogi scroll distance (1–65535, default 15)
   -h, --help      show this help
@@ -609,6 +594,8 @@ impl Args {
         let mut args = Self {
             host: String::new(),
             port: 24800,
+            input_feedback: false,
+            latency_stats: false,
             flip_scroll: false,
             scroll_pixels_per_notch: 15,
             openlogi_socket: None,
@@ -646,6 +633,8 @@ impl Args {
                             std::process::exit(2);
                         });
                 }
+                "--input-feedback" => args.input_feedback = true,
+                "--latency-stats" => args.latency_stats = true,
                 "--flip-scroll" => args.flip_scroll = true,
                 "-h" | "--help" => {
                     print!("{USAGE}");

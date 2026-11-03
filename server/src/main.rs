@@ -96,6 +96,7 @@ fn main() -> io::Result<()> {
         wheel: (0, 0),
         armed: true,
         swap_caps_esc: args.swap_caps_esc,
+        latency_stats: args.latency_stats,
         listener,
         net_tx,
         net_rx,
@@ -129,6 +130,7 @@ struct App {
     motion: (i64, i64),
     wheel: (i64, i64),
     swap_caps_esc: bool,
+    latency_stats: bool,
     listener: TcpListener,
     net_tx: mpsc::Sender<NetMsg>,
     net_rx: mpsc::Receiver<NetMsg>,
@@ -148,7 +150,12 @@ impl App {
         while let Ok((stream, addr)) = self.listener.accept() {
             log!("pending connection: {addr}");
             self.conn_id += 1;
-            match Connection::spawn(stream, self.net_tx.clone(), self.conn_id) {
+            match Connection::spawn(
+                stream,
+                self.net_tx.clone(),
+                self.conn_id,
+                self.latency_stats,
+            ) {
                 Ok(conn) => self.pending = Some((conn, addr)),
                 Err(e) => log!("connection setup failed: {e}"),
             }

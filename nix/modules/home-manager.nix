@@ -38,6 +38,15 @@ in
       description = "TCP port used by the server and client.";
     };
 
+    inputFeedback = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Reply to each input frame on macOS to mitigate TCP delayed ACK.
+        Enable for comparison with the default behavior; adds a Pong per input frame.
+      '';
+    };
+
     scrollPixelsPerNotch = lib.mkOption {
       type = lib.types.ints.between 1 65535;
       default = 15;
@@ -118,6 +127,8 @@ in
               "--openlogi-socket"
               cfg.openlogi.socket
             ]
+            ++ lib.optional cfg.inputFeedback "--input-feedback"
+            ++ lib.optional cfg.latencyStats "--latency-stats"
             ++ lib.optional cfg.flipScroll "--flip-scroll";
             RunAtLoad = true;
             KeepAlive = true;

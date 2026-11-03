@@ -16,6 +16,7 @@ use std::io::{self, Read, Write};
 
 #[cfg(unix)]
 pub mod bridge;
+pub mod latency;
 pub mod pointer;
 pub use pointer::PointerEvent;
 

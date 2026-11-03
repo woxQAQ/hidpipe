@@ -46,6 +46,12 @@ in
       description = "Mouse device name substring, or null for automatic detection.";
     };
 
+    latencyStats = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Log local latency counts, means and maxima every 5 seconds.";
+    };
+
     swapCapsEsc = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -94,6 +100,7 @@ in
           "--openlogi-socket"
           cfg.openlogi.socket
         ]
+        ++ lib.optional cfg.latencyStats "--latency-stats"
         ++ lib.optional cfg.swapCapsEsc "--swap-caps-esc"
       );
       Restart = "on-failure";
