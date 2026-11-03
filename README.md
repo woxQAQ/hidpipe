@@ -98,12 +98,30 @@ On macOS, import the Home Manager module:
 }
 ```
 
-This creates a launchd agent in the graphical login session. Grant
-`hidpipe-client` itself access in System Settings > Privacy & Security >
-Accessibility; the terminal's permission does not cover the agent. Use
-Cmd+Shift+G in the file picker to select `~/.nix-profile/bin/hidpipe-client`
-(or the `bin/hidpipe-client` under your Home Manager profile). A package upgrade
-changes the executable's Nix store path and may require granting access again.
+This creates a launchd agent in the graphical login session. On macOS,
+Home Manager installs real application bundles at `~/Applications/Hidpipe.app`
+and, with OpenLogi enabled, `~/Applications/OpenLogi Agent.app`. It signs them
+using a persistent certificate in a dedicated local Keychain; signing happens
+during activation, outside the Nix build sandbox. The key never enters the
+Nix store, and the login Keychain does not need to be unlocked over SSH.
+
+Grant **Hidpipe** and **OpenLogi Agent** access in System Settings > Privacy &
+Security > Accessibility. Use Cmd+Shift+G in the file picker to select the bundles
+under `~/Applications`. Migration from the old Nix-store executables requires
+one new authorization; their old entries may be removed manually. Subsequent
+activations use the same bundle IDs and certificate, preserving code identity
+across rebuilds and rollbacks. Keeping the identity is necessary for permission
+reuse; verify permission retention on the macOS version in use after migration.
+
+Back up `~/Library/Application Support/hidpipe/signing` privately. It contains
+the certificate, encrypted signing Keychain, and its password, with directory
+permissions 0700. Deleting or recreating it changes the signing identity and
+requires authorization again. Incomplete signing state fails activation rather
+than silently rotating the identity. The generated certificate lasts ten years;
+renewal needs a planned identity migration. This is local signing, not Developer
+ID distribution or notarization. Set `services.hidpipe.localSigning.enable = false;`
+to run directly from the Nix store instead, with its original permission behavior.
+
 Logs go to `~/Library/Logs/hidpipe.log`. The client requests event-posting
 permission before connecting and waits until access is granted. Revoking access
 closes the connection on the next heartbeat, releasing Linux input.
@@ -151,6 +169,7 @@ session and a compositor with layer-shell support.
 | `swapCapsEsc` | `false` | Linux |
 | `systemdTarget` | `"graphical-session.target"` | Linux |
 | `host` | required when enabled | macOS, Home Manager |
+| `localSigning.enable` | `true` on macOS | macOS, Home Manager; stable signed application bundles |
 | `flipScroll` | `false` | macOS, Home Manager |
 
 Check the Linux service with `systemctl --user status hidpipe` and
@@ -226,7 +245,9 @@ its first online pointing device unless a key is explicit. With multiple mice,
 set the key explicitly on both peers. Device keys and bindings do not have to
 match across systems. Quit any previously running OpenLogi agent once when
 migrating to the managed service, and remove its old login item. Grant the patched
-`openlogi-agent` and `hidpipe-client` Accessibility access on macOS.
+`openlogi-agent` and `hidpipe-client` Accessibility access on macOS. With local
+signing enabled (the default), authorize their bundles in `~/Applications` as
+described above, rather than the Nix-store executables.
 
 The module manages `openlogi-agent.service` on Linux and a launchd agent on macOS.
 The bridged package owns the capture-readiness, virtual-device identity and

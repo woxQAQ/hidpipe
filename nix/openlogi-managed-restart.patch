@@ -1,0 +1,16 @@
+diff --git a/crates/openlogi-agent/src/main.rs b/crates/openlogi-agent/src/main.rs
+--- a/crates/openlogi-agent/src/main.rs
++++ b/crates/openlogi-agent/src/main.rs
+@@ -74,7 +74,11 @@ fn main() {
+     // Watch our own executable and restart as the new image when an app update
+     // replaces it — see `self_restart`. Only the lock-holding (real) agent
+     // watches, so a losing duplicate can't restart anything.
+-    self_restart::spawn();
++    // Managed services are reloaded by their service manager after updates.
++    // Relaunching through LaunchServices would lose the bridge environment.
++    if std::env::var_os("OPENLOGI_MANAGED_SERVICE").is_none() {
++        self_restart::spawn();
++    }
+ 
+     let config = Config::load_or_default().unwrap_or_else(|e| {
+         warn!(error = %e, "could not load config.toml; using defaults");

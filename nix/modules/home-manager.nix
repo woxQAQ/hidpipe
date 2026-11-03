@@ -8,6 +8,19 @@ let
   cfg = config.services.hidpipe;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   server = import ./server.nix { inherit lib pkgs cfg; };
+  signedApps = isDarwin && cfg.localSigning.enable;
+  applicationsDirectory = "${config.home.homeDirectory}/Applications";
+  signingDirectory = "${config.home.homeDirectory}/Library/Application Support/hidpipe/signing";
+  clientExecutable =
+    if signedApps then
+      "${applicationsDirectory}/Hidpipe.app/Contents/MacOS/hidpipe-client"
+    else
+      lib.getExe cfg.package;
+  agentExecutable =
+    if signedApps then
+      "${applicationsDirectory}/OpenLogi Agent.app/Contents/MacOS/openlogi-agent"
+    else
+      "${cfg.openlogi.package}/bin/openlogi-agent";
   openlogi = import ./openlogi.nix {
     inherit lib pkgs cfg;
     homeDirectory = config.home.homeDirectory;
@@ -24,6 +37,19 @@ in
       defaultText = lib.literalExpression "hidpipe.packages.\${pkgs.stdenv.hostPlatform.system}.default";
       description = "Package providing the server on Linux or the client on macOS.";
     };
+
+    localSigning.enable =
+      lib.mkEnableOption "persistent local signing and stable macOS application bundles"
+      // {
+        default = isDarwin;
+        description = ''
+          Install Hidpipe.app and, when enabled, OpenLogi Agent.app in ~/Applications.
+          Sign both with a persistent identity held in a private local Keychain so
+          rebuilt programs retain the same code identity. Initial Accessibility
+          authorization is still required. The signing state is stored in
+          ~/Library/Application Support/hidpipe/signing and must survive upgrades.
+        '';
+      };
 
     host = lib.mkOption {
       type = lib.types.nullOr lib.types.nonEmptyStr;
@@ -99,11 +125,30 @@ in
       })
 
       (lib.mkIf isDarwin {
+        # Install before launchd starts the jobs. Store paths in the job
+        # environments also make Home Manager reload them after package updates.
+        home.activation.hidpipeSignedApps = lib.mkIf signedApps (
+          lib.hm.dag.entryBetween [ "setupLaunchAgents" ] [ "writeBoundary" ] ''
+            run env OPENSSL=${lib.getExe pkgs.openssl} \
+              ${pkgs.bash}/bin/bash ${../macos/install-apps.sh} \
+              ${lib.escapeShellArg signingDirectory} \
+              ${lib.escapeShellArg applicationsDirectory} \
+              ${lib.escapeShellArg (lib.getExe cfg.package)} \
+              ${lib.escapeShellArg (
+                if cfg.openlogi.enable then "${cfg.openlogi.package}/bin/openlogi-agent" else ""
+              )}
+          ''
+        );
+
         launchd.agents.openlogi-agent = lib.mkIf cfg.openlogi.enable {
           enable = true;
           config = {
-            ProgramArguments = [ "${cfg.openlogi.package}/bin/openlogi-agent" ];
-            EnvironmentVariables = openlogi.environment;
+            ProgramArguments = [ agentExecutable ];
+            EnvironmentVariables =
+              openlogi.environment
+              // lib.optionalAttrs signedApps {
+                HIDPIPE_SOURCE_PACKAGE = toString cfg.openlogi.package;
+              };
             RunAtLoad = true;
             KeepAlive = true;
             ProcessType = "Interactive";
@@ -116,7 +161,7 @@ in
           enable = true;
           config = {
             ProgramArguments = [
-              (lib.getExe cfg.package)
+              clientExecutable
               cfg.host
               "--port"
               (toString cfg.port)
@@ -130,6 +175,9 @@ in
             ++ lib.optional cfg.inputFeedback "--input-feedback"
             ++ lib.optional cfg.latencyStats "--latency-stats"
             ++ lib.optional cfg.flipScroll "--flip-scroll";
+            EnvironmentVariables = lib.optionalAttrs signedApps {
+              HIDPIPE_SOURCE_PACKAGE = toString cfg.package;
+            };
             RunAtLoad = true;
             KeepAlive = true;
             ProcessType = "Interactive";
