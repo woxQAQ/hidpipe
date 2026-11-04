@@ -15,23 +15,35 @@ flowchart LR
     subgraph Linux["Linux (server: machine with the keyboard and mouse)"]
         K[physical keyboard and mouse] --> KD[keyd: the only place remapping happens]
         KD -->|raw evdev events| S[hidpipe-server<br/>EVIOCGRAB + edge switching]
+        K -.->|Logitech mouse| OL_L[openlogi-agent<br/>optional pointer bridge]
+        OL_L -.->|unmapped pointer events| S
     end
-    subgraph Wire["wire protocol: no semantics"]
-        S -->|"HID usage ID frames<br/>plain TCP, TCP_NODELAY"| C
+    subgraph Wire["wire protocol v1: no semantics"]
+        S -->|"HID usage IDs + pointer frames<br/>plain TCP, TCP_NODELAY"| C
     end
     subgraph macOS["macOS (client)"]
-        C[hidpipe-client<br/>CGEventPost @ HID tap] --> SYS[system]
+        C[hidpipe-client<br/>CGEventPost @ HID tap] -.->|resolve bindings| OL_M[openlogi-agent<br/>optional macOS bindings]
+        C --> SYS[system]
         KB[Karabiner] -.->|driver level, cannot see injected events| SYS
     end
 ```
 
 Three design invariants:
 
-1. The protocol has no semantics. Only raw HID events go on the wire. No keymap negotiation, no modifier state machine, no cache. Nothing that can drift.
-2. Keyboard remapping happens exactly once, at a fixed place. keyd on the capture side resolves stateful remaps like `overload(control, esc)` before keyboard events go on the wire. Quartz injection bypasses driver-level keyboard remapping. With the OpenLogi backend, mouse bindings are resolved exactly once on the machine currently being controlled.
-3. Disconnect releases everything. When the connection dies, the server ungrabs at once and the client releases all held keys on Drop. Grab and key state live and die with the connection.
+1. **The protocol has no semantics.** Only raw HID and pointer events go on the wire. No keymap negotiation, no modifier state machine, no cache. Nothing that can drift.
+2. **Remapping happens exactly once, at a fixed place.** `keyd` on the capture side resolves stateful keyboard remaps like `overload(control, esc)` before events go on the wire, while Quartz injection on macOS bypasses driver-level keyboard remapping (such as Karabiner). With the OpenLogi backend, mouse bindings are resolved once on whichever machine currently owns the pointer.
+3. **Disconnect releases everything.** When the connection dies, the server ungrabs at once and the client releases all held keys and buttons on `Drop` (or signal). Grab, capture leases, and held-input state live and die with the connection.
 
-## Build
+### Edge switching
+
+Earlier iterations rejected pseudo edge detection that accumulates deltas to estimate cursor position, because estimation always drifts. `hidpipe` uses two deterministic paths instead:
+
+- **Linux → macOS:** Push the cursor past the right edge of the Linux screen. The trigger is a Wayland layer-shell barrier, so the compositor itself detects the crossing. In remote mode, Linux input devices are grabbed (freezing the local cursor) and all input goes to the Mac.
+- **macOS → Linux:** Push the cursor against the left edge of the Mac display and keep pushing to hand control back. The client clamps cursor coordinates precisely and triggers return once leftward pressure within a sliding window exceeds the threshold.
+
+## Build and manual usage
+
+### Build
 
 ```bash
 # Linux (capture side)
@@ -41,8 +53,7 @@ cargo build --release -p hidpipe-server
 cargo build --release -p hidpipe-client
 ```
 
-`nix develop` provides a Rust toolchain. The flake also provides native packages
-for `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`:
+`nix develop` provides a Rust toolchain. The flake also provides native packages for `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`:
 
 ```bash
 nix build                        # server on Linux, client on macOS
@@ -50,9 +61,48 @@ nix run . -- --help
 nix flake check                  # build the native package and run protocol tests
 ```
 
+### Run
+
+Linux requires a Wayland session with layer-shell support and read access to `/dev/input/event*` (membership in the `input` group is sufficient):
+
+```bash
+hidpipe-server                    # auto-detect devices, prefer the keyd virtual keyboard
+hidpipe-server --keyboard "keyd" --mouse "MX Master" --port 24800
+```
+
+macOS:
+
+```bash
+hidpipe-client <linux-ip>         # retries once a second until connected
+```
+
+On first run, grant **Accessibility** access to the executable in `System Settings > Privacy & Security > Accessibility`. A `launchd` service needs its own permission; the terminal's permission does not cover it. Until event-posting access is granted, the client waits without connecting to Linux.
+
+### CLI options
+
+| `hidpipe-server` | Default | Description |
+|---|---|---|
+| `--bind <addr>` | `0.0.0.0` | Listen address |
+| `--port <port>` | `24800` | Listen TCP port |
+| `--keyboard <substr>` | auto-detect | Keyboard device name substring filter (prefers `keyd` virtual keyboard) |
+| `--mouse <substr>` | auto-detect | Mouse device name substring filter (mutually exclusive with `--openlogi-socket`) |
+| `--openlogi-socket <path>` | disabled | Capture the mouse through an OpenLogi bridge socket |
+| `--swap-caps-esc` | off | Swap Caps Lock and Escape on capture (use only when `keyd` or `udev` does not already do so) |
+| `--latency-stats` | off | Log local stage timing summaries every 5 seconds |
+
+| `hidpipe-client` | Default | Description |
+|---|---|---|
+| `<server-address>` | required | Host name or IP address of the Linux server |
+| `--port <port>` | `24800` | Server TCP port |
+| `--openlogi-socket <path>` | disabled | Resolve mouse input with the local OpenLogi agent |
+| `--flip-scroll` | off | Reverse scroll direction |
+| `--scroll-pixels-per-notch <px>` | `15` | OpenLogi scroll distance per notch on both axes (`1–65535`) |
+| `--latency-stats` | off | Log local stage timing summaries every 5 seconds and `[slow-inject]` records (`>= 2 ms`) |
+| `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
+
 ## NixOS and Home Manager
 
-Add hidpipe to your flake inputs:
+Add `hidpipe` to your flake inputs:
 
 ```nix
 inputs.hidpipe = {
@@ -61,7 +111,9 @@ inputs.hidpipe = {
 };
 ```
 
-On the Linux capture machine, import the NixOS module:
+### Linux capture server (NixOS or Home Manager)
+
+On NixOS, import the NixOS module:
 
 ```nix
 { inputs, ... }:
@@ -78,10 +130,28 @@ On the Linux capture machine, import the NixOS module:
 }
 ```
 
-The NixOS module adds the user to the `input` group and installs a systemd user
-service, restricted to that user. Log out and back in after the first activation
-so the user service manager picks up the new group membership. The service starts
-with `graphical-session.target` and stops with the desktop session.
+The NixOS module adds `user` to the `input` group and installs a `systemd` user service restricted to that user. Log out and back in after the first activation so the user service manager picks up the new group membership. The service starts and stops with `graphical-session.target`.
+
+Alternatively, manage the Linux server via Home Manager using the same server options:
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.hidpipe.homeManagerModules.default ];
+
+  services.hidpipe = {
+    enable = true;
+    keyboard = "keyd";
+    mouse = "MX Master";
+  };
+}
+```
+
+When using Home Manager on Linux, configure input permissions and the firewall at the system level yourself (for example, `users.users.alice.extraGroups = [ "input" ];` and `networking.firewall.allowedTCPPorts = [ 24800 ];`). Choose either NixOS or Home Manager to manage the Linux service—both define `hidpipe.service`.
+
+The Wayland compositor must import `WAYLAND_DISPLAY` into the `systemd` user environment before starting the session target; NixOS Sway integration and UWSM handle this automatically. For compositors with a dedicated session target, set `services.hidpipe.systemdTarget` accordingly.
+
+### macOS client (Home Manager)
 
 On macOS, import the Home Manager module:
 
@@ -98,92 +168,56 @@ On macOS, import the Home Manager module:
 }
 ```
 
-This creates a launchd agent in the graphical login session. On macOS,
-Home Manager installs real application bundles at `~/Applications/Hidpipe.app`
-and, with OpenLogi enabled, `~/Applications/OpenLogi Agent.app`. It signs them
-using a persistent certificate in a dedicated local Keychain; signing happens
-during activation, outside the Nix build sandbox. The key never enters the
-Nix store, and the login Keychain does not need to be unlocked over SSH.
+This creates a `launchd` agent in the graphical login session (`~/Library/Logs/hidpipe.log`). The client checks event-posting permission before connecting and waits until access is granted; revoking access closes the connection on the next heartbeat and releases Linux input.
 
-Grant **Hidpipe** and **OpenLogi Agent** access in System Settings > Privacy &
-Security > Accessibility. Use Cmd+Shift+G in the file picker to select the bundles
-under `~/Applications`. Migration from the old Nix-store executables requires
-one new authorization; their old entries may be removed manually. Subsequent
-activations use the same bundle IDs and certificate, preserving code identity
-across rebuilds and rollbacks. Keeping the identity is necessary for permission
-reuse; verify permission retention on the macOS version in use after migration.
+#### Persistent local signing on macOS
 
-Back up `~/Library/Application Support/hidpipe/signing` privately. It contains
-the certificate, encrypted signing Keychain, and its password, with directory
-permissions 0700. Deleting or recreating it changes the signing identity and
-requires authorization again. Incomplete signing state fails activation rather
-than silently rotating the identity. The generated certificate lasts ten years;
-renewal needs a planned identity migration. This is local signing, not Developer
-ID distribution or notarization. Set `services.hidpipe.localSigning.enable = false;`
-to run directly from the Nix store instead, with its original permission behavior.
+By default (`services.hidpipe.localSigning.enable = true`), Home Manager installs application bundles at `~/Applications/Hidpipe.app` (and `~/Applications/OpenLogi Agent.app` when OpenLogi is enabled). During activation—outside the Nix build sandbox—it signs them using a persistent certificate stored in a dedicated local Keychain under `~/Library/Application Support/hidpipe/signing` (`0700`). The private key never enters the Nix store, and the login Keychain does not need to be unlocked over SSH.
 
-Logs go to `~/Library/Logs/hidpipe.log`. The client requests event-posting
-permission before connecting and waits until access is granted. Revoking access
-closes the connection on the next heartbeat, releasing Linux input.
+1. Open `System Settings > Privacy & Security > Accessibility`.
+2. Grant access to **Hidpipe** (and **OpenLogi Agent** if enabled). Use `Cmd+Shift+G` in the file picker to select the bundles under `~/Applications`.
+3. If migrating from raw Nix-store executables, authorize the new app bundles once and remove the old store entries.
 
-Home Manager also supports the Linux server, using the same server options as
-the NixOS module:
+Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, preserving code identity for macOS TCC permissions. Back up `~/Library/Application Support/hidpipe/signing` privately: deleting or recreating it rotates the identity and requires re-authorization (incomplete signing state fails activation rather than silently rotating the identity). The generated certificate is valid for ten years. Set `services.hidpipe.localSigning.enable = false;` to run directly from the Nix store instead.
 
-```nix
-{ inputs, ... }:
-{
-  imports = [ inputs.hidpipe.homeManagerModules.default ];
+### Service inspection
 
-  services.hidpipe = {
-    enable = true;
-    keyboard = "keyd";
-    mouse = "MX Master";
-  };
-}
-```
+- **Linux:** `systemctl --user status hidpipe` and `journalctl --user -u hidpipe -f`
+- **macOS:** `launchctl print gui/$(id -u)/org.nix-community.home.hidpipe`
 
-When using Home Manager on Linux, configure input permissions and the firewall
-at the system level yourself. On NixOS, for example:
+### Module options reference
 
-```nix
-users.users.alice.extraGroups = [ "input" ];
-networking.firewall.allowedTCPPorts = [ 24800 ];
-```
-
-Choose either NixOS or Home Manager to manage the Linux service. Both use the
-unit name `hidpipe.service`. The compositor must import `WAYLAND_DISPLAY` into
-the systemd user environment before starting the session target; NixOS Sway
-integration and UWSM handle this. For a compositor with its own session target,
-set `services.hidpipe.systemdTarget` accordingly. The server requires a Wayland
-session and a compositor with layer-shell support.
-
-| module option (`services.hidpipe.*`) | default | applies to |
-|---|---|---|
-| `enable` | `false` | both platforms |
-| `package` | native hidpipe package | both platforms |
-| `port` | `24800` | both platforms |
-| `user` | required when enabled | NixOS only |
-| `openFirewall` | `false` | NixOS only |
-| `bind` | `"0.0.0.0"` | Linux |
-| `keyboard` / `mouse` | `null` (auto-detect) | Linux |
-| `swapCapsEsc` | `false` | Linux |
-| `systemdTarget` | `"graphical-session.target"` | Linux |
-| `host` | required when enabled | macOS, Home Manager |
-| `localSigning.enable` | `true` on macOS | macOS, Home Manager; stable signed application bundles |
-| `flipScroll` | `false` | macOS, Home Manager |
-
-Check the Linux service with `systemctl --user status hidpipe` and
-`journalctl --user -u hidpipe -f`. On macOS, use
-`launchctl print gui/$(id -u)/org.nix-community.home.hidpipe`.
+| Option (`services.hidpipe.*`) | Default | Applies to | Description |
+|---|---|---|---|
+| `enable` | `false` | Linux, macOS | Enable the `hidpipe` service |
+| `package` | native `hidpipe` package | Linux, macOS | Package providing `hidpipe-server` or `hidpipe-client` |
+| `port` | `24800` | Linux, macOS | TCP port used by server and client |
+| `latencyStats` | `false` | Linux, macOS | Log local latency counts, means, and maxima every 5 seconds |
+| `user` | required | NixOS | Desktop user who runs the server and receives `input` (and `uinput`) group membership |
+| `openFirewall` | `false` | NixOS | Open `services.hidpipe.port` in the firewall |
+| `bind` | `"0.0.0.0"` | Linux | Listen address for the server |
+| `keyboard` | `null` (auto-detect) | Linux | Keyboard device name substring |
+| `mouse` | `null` (auto-detect) | Linux | Mouse device name substring (`null` required when `openlogi.enable = true`) |
+| `swapCapsEsc` | `false` | Linux | Swap Caps Lock and Escape on capture |
+| `systemdTarget` | `"graphical-session.target"` | Linux | User systemd target that starts and stops the service |
+| `host` | required on macOS | macOS (HM) | Host name or IP address of the Linux server |
+| `localSigning.enable` | `true` on macOS | macOS (HM) | Install and locally sign stable app bundles in `~/Applications` |
+| `flipScroll` | `false` | macOS (HM) | Reverse scroll direction of injected mouse events |
+| `scrollPixelsPerNotch` | `15` | macOS (HM) | Pixels per wheel notch (`1–65535`) for OpenLogi mouse input on both axes |
+| `inputFeedback` | `false` | macOS (HM) | Reply with a `Pong` to each input frame to mitigate TCP delayed ACK |
+| `openlogi.enable` | `false` | Linux, macOS | Route mouse input through OpenLogi with destination-side bindings |
+| `openlogi.mouse` | `"MX Master"` | Linux | Physical Logitech mouse name substring (must match exactly one mouse) |
+| `openlogi.device` | `null` | Linux, macOS | OpenLogi config key (`null` selects the first online device on Linux or saved selection on macOS) |
+| `openlogi.socket` | `"~/.cache/openlogi-hidpipe/pointer.sock"` | Linux, macOS | Private local socket shared by `hidpipe` and `openlogi-agent` |
+| `openlogi.gui.enable` | `true` | Linux, macOS | Build and install the OpenLogi GUI alongside the CLI and agent |
+| `openlogi.basePackage` | `pkgs.openlogi` | Linux, macOS | Unmodified OpenLogi `0.6.25` package to which bridge patches are applied |
+| `openlogi.package` | patched OpenLogi | Linux, macOS | Patched OpenLogi package built with `openlogi.gui.enable` |
 
 ## OpenLogi mouse backend
 
-Enable this backend on **both** peers to use macOS's own OpenLogi bindings instead
-of forwarding Linux-generated shortcuts. The bridge patch targets OpenLogi
-**0.6.25**; `nix/openlogi-package.nix` applies it without changing dependencies.
-The protocol module in `proto/src/pointer.rs` is compiled into both programs.
-The editable OpenLogi worktree can link that file at
-`crates/openlogi-agent-core/src/remote/wire.rs`.
+Enable the OpenLogi backend on **both** peers to evaluate mouse bindings on the active destination machine instead of forwarding Linux-generated shortcuts. The bridge patch targets OpenLogi **0.6.25** (`nix/openlogi-package.nix`), sharing the wire protocol in `proto/src/pointer.rs`. The network protocol is version `1`; a version or pointer-backend mismatch is rejected during the `Hello` handshake before capture begins.
+
+### Configuration
 
 On NixOS:
 
@@ -196,35 +230,9 @@ services.hidpipe = {
     enable = true;
     mouse = "MX Master 2S";
     gui.enable = true; # default; retain the OpenLogi settings UI
-    # device = "<OpenLogi config key>"; # required for multiple configured mice
+    # device = "<OpenLogi config key>"; # required when multiple mice are configured
   };
 };
-```
-
-Disable logiops and other services that capture or divert the same mouse. The
-module provides the patched OpenLogi GUI and agent, grants the user `input` and
-`uinput` membership, and enables `/dev/uinput`. Log out and back in after changing
-groups. OpenLogi owns the physical mouse for the entire session; hidpipe only grabs
-the keyd keyboard when entering remote mode. If keyd's wildcard identifies the
-mouse as a keyboard, exclude its vendor/product ID. For the MX Master 2S:
-
-```nix
-services.keyd.keyboards.default.ids = [ "*" "-046d:4069" ];
-```
-
-OpenLogi preserves that ID on its virtual mouse, so the exclusion covers both.
-The NixOS module also reapplies udev permissions to already-connected Logitech
-HID devices when its rules change.
-
-`services.hidpipe.openlogi.gui.enable` defaults to `true`. This builds and installs
-the Linux desktop launcher or macOS application bundle alongside the agent, and
-leaves GUI startup to the user. Set it to `false` for a CLI and agent installation.
-The package function exposes the same choice as `withGui`:
-
-```nix
-inputs.hidpipe.packages.${pkgs.stdenv.hostPlatform.system}.openlogi.override {
-  withGui = false;
-}
 ```
 
 On macOS with Home Manager:
@@ -235,242 +243,85 @@ services.hidpipe = {
   host = "linux-host.local";
   openlogi.enable = true;
   # openlogi.device = "<Mac OpenLogi config key>";
+  # scrollPixelsPerNotch = 15;
 };
 ```
 
-Use the OpenLogi GUI on each machine to configure that machine's actions. The Mac
-agent uses its saved device selection unless `openlogi.device` is explicit; the
-mouse need not be physically connected to the Mac. Linux automatically chooses
-its first online pointing device unless a key is explicit. With multiple mice,
-set the key explicitly on both peers. Device keys and bindings do not have to
-match across systems. Quit any previously running OpenLogi agent once when
-migrating to the managed service, and remove its old login item. Grant the patched
-`openlogi-agent` and `hidpipe-client` Accessibility access on macOS. With local
-signing enabled (the default), authorize their bundles in `~/Applications` as
-described above, rather than the Nix-store executables.
+### Setup notes
 
-The module manages `openlogi-agent.service` on Linux and a launchd agent on macOS.
-The bridged package owns the capture-readiness, virtual-device identity and
-mutable-config fixes; consumers do not need to apply additional OpenLogi patches.
-Logs on the Mac are in `~/Library/Logs/openlogi-agent.log`. Socket paths default to
-`~/.cache/openlogi-hidpipe/pointer.sock` and must be in a private directory (0700).
-The agent uses `OPENLOGI_MANAGED_SERVICE=1` to leave autostart management to Nix.
-Override `openlogi.basePackage` when using another nixpkgs input:
+- **Linux device ownership:** Disable `logiops` or any other service that captures the same mouse. The NixOS module grants `input` and `uinput` membership, enables `/dev/uinput`, and reapplies `udev` permissions to connected Logitech `hidraw` devices. OpenLogi owns the physical mouse for the entire session; `hidpipe` only grabs the `keyd` keyboard when entering remote mode.
+- **Excluding the mouse from `keyd`:** If `keyd`'s wildcard matches the mouse, exclude its vendor/product ID (OpenLogi preserves this ID on its virtual mouse, so one exclusion covers both). For the MX Master 2S:
+  ```nix
+  services.keyd.keyboards.default.ids = [ "*" "-046d:4069" ];
+  ```
+- **Per-machine profiles:** Use the OpenLogi GUI on each machine to configure its actions; device keys and bindings do not need to match across systems, and the mouse does not need to be physically connected to the Mac. When multiple pointing devices are configured, set `openlogi.device` explicitly.
+- **macOS migration & permissions:** Quit any previously running OpenLogi agent once when switching to the managed service (`~/Library/Logs/openlogi-agent.log`) and remove its old login item. Grant Accessibility access to both **Hidpipe** and **OpenLogi Agent** (`~/Applications` when local signing is enabled).
+- **GUI & package overrides:** Set `services.hidpipe.openlogi.gui.enable = false;` (or override the flake package with `withGui = false`) for a headless CLI/agent build. Override `services.hidpipe.openlogi.basePackage` if pulling OpenLogi from another `nixpkgs` input.
+- **Manual execution:** Set `OPENLOGI_BRIDGE_SOCKET=<path>`, optionally `OPENLOGI_BRIDGE_DEVICE=<key>`, and on Linux `OPENLOGI_BRIDGE_MOUSE=<substr>` for `openlogi-agent`, then pass `--openlogi-socket <path>` to `hidpipe-server` and `hidpipe-client`. The socket directory must have `0700` permissions.
 
-```nix
-services.hidpipe.openlogi.basePackage = fastest-pkg.openlogi;
-```
+### Scroll behavior and lease semantics
 
-For manual operation, give the agent `OPENLOGI_BRIDGE_SOCKET` and optionally
-`OPENLOGI_BRIDGE_DEVICE`; on Linux also give it `OPENLOGI_BRIDGE_MOUSE` (a name
-substring selecting exactly one physical Logitech mouse). Pass
-`--openlogi-socket <path>` to hidpipe on each machine. The agent's socket is
-local-only and versioned independently of GUI IPC.
+- **High-resolution scrolling:** The bridge preserves high-resolution wheel motion (including sub-notch accumulation across pauses) on both axes. Scroll distance is scaled only at the destination: on macOS, OpenLogi wheel input defaults to `15` pixels per notch (`scrollPixelsPerNotch` / `--scroll-pixels-per-notch`, range `1–65535`; `30` matches the previous distance). Fractional pixels are accumulated so slow scrolling stays smooth. Local Linux scrolling, native `evdev` capture, and OpenLogi bindings that emit synthetic scroll actions are unaffected.
+- **Lease safety and button quarantine:** Remote pointer capture uses a connection-scoped lease with a 750 ms heartbeat deadline. A held mouse button prevents remote entry. Disconnect, a stalled server, an input-hook failure, or a full capture queue revokes the lease and restores Linux routing immediately. Buttons still held at revocation are quarantined until physical release (sharing one atomic state with physical holds so concurrent releases are never lost), and pending gestures are cancelled before local routing resumes.
+- **Hardware settings:** DPI, SmartShift, and other device-level settings belong to the Linux profile; the bridge does not forward hardware configuration changes from macOS back to the physical mouse.
 
-The bridge preserves high-resolution wheel movement on both axes, including
-sub-notch input across pauses. The Linux virtual device keeps its original wheel
-capabilities. Scroll distance is adjusted only at the destination.
+## Diagnostics
 
-On the Mac, hidpipe renders OpenLogi wheel input at 15 pixels per notch on both
-axes. To adjust the scroll distance, set the Home Manager option on the Mac
-(lower values scroll less):
+### Latency diagnostics
 
-```nix
-services.hidpipe.scrollPixelsPerNotch = 15;
-```
+Enable `services.hidpipe.latencyStats = true;` (or `--latency-stats`) on both machines to log stage sample counts (`n`), mean durations (`mean_us`), and maximum durations (`max_us`) every 5 seconds while connected, plus remaining samples on session exit. Diagnostics never log key codes or pointer coordinates.
 
-For manual operation, pass `--scroll-pixels-per-notch 15` to `hidpipe-client`.
-The range is 1–65535; 30 restores the previous scroll distance. Fractional pixels
-are accumulated, preserving high-resolution input at lower speeds. This setting
-does not affect local Linux scrolling, native evdev input, or OpenLogi bindings
-that generate their own scroll actions.
+- **Linux stages:** `server.queue` (capture enqueue to writer dequeue; excludes `evdev` polling interval) and `server.write` (frame serialization and socket write).
+- **macOS stages:** `client.resolve` (OpenLogi IPC request/reply), `client.inject` (input handling including Quartz calls), `client.feedback` (optional reply write), and `client.process` (total frame handling, excluding blocking socket read). Stages have independent counts because OpenLogi-consumed events skip injection.
+- **Slow injection records (macOS):** When `client.inject` takes at least `2 ms`, the client logs `[slow-inject]` with a sequence number, input category, completion timestamp (`epoch_us`), total time, and breakdown across cached display bounds lookup (`bounds`), input state acquisition (`state`), Quartz event creation (`create`), property configuration (`configure`), `CGEventPost` (`post`), event release (`drop`), and remaining work (`other_us`). See [`diag/macos-injection-latency.md`](diag/macos-injection-latency.md) for details.
 
-Capture is a connection-scoped lease with a 750 ms heartbeat deadline. A held
-mouse button prevents entry. Disconnect, a stalled server, input-hook failure,
-or a full capture queue revokes the lease and restores Linux routing. Buttons
-still held at revocation are quarantined until release; pending gestures are
-cancelled before Linux routing resumes. Physical holds and quarantine bits share
-one atomic state, so a concurrent release cannot be overwritten by lease cleanup.
-Released side buttons can begin new local clicks and gestures immediately. On
-macOS, binding lookup happens before normal mouse injection, and a held button
-keeps its original disposition across config
-or foreground-app changes. Sub-notch main-wheel motion is retained. Hardware settings
-such as DPI and SmartShift belong to the Linux profile; this bridge does not
-forward hardware actions from the Mac back to the physical device.
-
-The network protocol is version 1. Upgrade both hidpipe peers together; a
-version or pointer-backend mismatch is rejected before capture. Native evdev
-capture remains available when OpenLogi is disabled.
-
-## Run
-
-Linux needs a Wayland session with layer-shell support and read access to
-`/dev/input/event*`; membership in the `input` group is enough for device access.
-
-```bash
-hidpipe-server                    # auto-detect devices, prefer the keyd virtual keyboard
-hidpipe-server --keyboard "keyd" --mouse "MX Master" --port 24800
-```
-
-macOS:
-
-```bash
-hidpipe-client <linux-ip>         # retries once a second until connected
-```
-
-On first run, grant Accessibility access to the executable. A launchd service needs its own permission; the terminal's permission does not cover it. Until event-posting access is granted, the client waits without connecting to Linux.
-
-Switching works like this. Push the cursor past the right edge of the Linux screen to enter remote mode; the trigger is a layer-shell barrier, so the compositor itself detects the crossing. On the Mac, push the cursor against the left edge and keep pushing to hand control back. In remote mode the Linux cursor freezes because the devices are grabbed, and all input goes to the Mac.
-
-## Options
-
-| server | default | description |
-|---|---|---|
-| `--bind` / `--port` | 0.0.0.0 / 24800 | listen address and port |
-| `--keyboard` / `--mouse` | auto-detect | device name substring filter |
-| `--swap-caps-esc` | off | redo the caps/esc swap on the capture side (only when keyd does not do it) |
-
-| client | default | description |
-|---|---|---|
-| `--port` | 24800 | server port |
-| `--flip-scroll` | off | reverse scroll direction |
-| `--scroll-pixels-per-notch` | 15 | OpenLogi scroll distance per notch, on both axes (1–65535) |
-
-## Latency diagnostics
-
-Enable `services.hidpipe.latencyStats = true;` on both machines to log local
-stage counts, mean durations, and maximum durations every five seconds while
-connected. Manual runs accept `--latency-stats` on both executables. Remaining
-samples are reported when the session ends normally or returns an error.
-Diagnostics are disabled by default and never log key codes or pointer contents.
-With statistics enabled, the Mac also logs `[slow-inject]` for input handling
-that takes at least 2 ms. Each record includes a process-local sequence number,
-input category, completion timestamp (`epoch_us`), total time, and time spent
-reading cached display geometry (`bounds`), acquiring input state (`state`), creating
-Quartz events (`create`), setting properties (`configure`), posting (`post`),
-and releasing events (`drop`). `other_us` covers the remaining work. These are
-wall-clock durations, including scheduling delays. Slow-record formatting is
-outside its reported total but remains part of the enclosing `client.inject`
-summary. See [the Mac injection investigation](diag/macos-injection-latency.md)
-for measurements and the passive probe. Main-display ID and bounds are queried
-at startup and refreshed on a background thread after CoreGraphics display
-configuration notifications; pointer handling reads the cached snapshot.
-
-The Linux log reports `server.queue` (enqueue to writer dequeue) and
-`server.write` (serialization and socket write). The Mac log reports
-`client.resolve` (OpenLogi request/reply), `client.inject` (input handling,
-including Quartz calls), `client.feedback` (optional reply write), and
-`client.process` (processing a received frame, excluding the blocking read).
-Each row contains its sample count `n`, `mean_us`, and `max_us`. Stages have
-independent counts: consumed OpenLogi events do not produce injection samples.
-These are local durations, not end-to-end input or application display latency.
-`server.queue` starts after capture, so it does not include the Linux capture
-loop's polling delay. A completed write or CGEventPost call does not mean the
-peer or application has processed the input.
-
-For a comparison with Deskflow's delayed-ACK workaround, enable this option on
-the **Mac**, leaving latency statistics enabled on both peers:
+To evaluate TCP delayed-ACK behavior against Deskflow's workaround, enable `inputFeedback` on the **Mac** alongside `latencyStats` on both peers:
 
 ```nix
 services.hidpipe = {
   latencyStats = true;
-  inputFeedback = true;
+  inputFeedback = true; # or --input-feedback
 };
 ```
 
-The equivalent client flag is `--input-feedback`. It sends one existing Pong
-frame per input frame, before local resolution or injection. Ping retains its
-normal reply and Pong is never echoed. This needs no protocol version change
-and works with an existing server. The option defaults to `false` pending
-measurements and adds a reply packet per input frame with TCP_NODELAY enabled.
-The server side of the new diagnostics requires the updated server package.
+This replies with one `Pong` frame per input frame before local resolution or injection. Compare perceived responsiveness, TCP RTT/retransmissions, and stage timings with `inputFeedback` off and on under identical network conditions. See [`diag/deskflow-latency.md`](diag/deskflow-latency.md) and [`diag/deskflow-network.md`](diag/deskflow-network.md) for background.
 
-Compare the same movement, typing, and scrolling with `inputFeedback` off and
-on; keep the mouse configuration and network unchanged. Compare perceived
-responsiveness and TCP RTT/retransmissions as well as local timing summaries:
-a network improvement need not change the local stage timings. Avoid inferring
-macOS ACK timing from Linux's receive-side `ato` value. See
-[the Deskflow source investigation](diag/deskflow-latency.md) for evidence and
-remaining optimization constraints.
+### Scroll diagnostics (Linux)
 
-## Scroll diagnostics (Linux)
+Build and run the passive `evdev` wheel listener (never grabs the device or injects input):
 
-Build the passive evdev listener using the server's existing dependencies:
-
-```sh
+```bash
 cargo build -p hidpipe-server --example scroll
 sudo target/debug/examples/scroll --list
 sudo target/debug/examples/scroll /dev/input/eventN | tee /tmp/hidpipe-scroll-linux.log
 ```
 
-Replace `eventN` with a wheel device from `--list`. Root is only needed when
-input-device permissions require it. The listener never grabs the device or
-injects input. Stop with Ctrl-C.
+Each output line represents one wheel-containing `SYN_REPORT` frame with elapsed time, kernel timestamp, interval since the previous wheel frame (`dt`), and raw wheel events (`REL_WHEEL`, `REL_HWHEEL`, and their `HI_RES` variants at 120 units per notch). Stop `openlogi-agent` or `hidpipe-server` first if an exclusive grab silences the physical device.
 
-Each line is a wheel-containing `SYN_REPORT` frame, with elapsed time, the kernel
-event timestamp, the interval since the previous wheel frame (`dt`), and the
-original wheel events in their original order. `REL_WHEEL` is vertical and
-`REL_HWHEEL` horizontal; their `HI_RES` variants use 120 units per notch.
-Ordinary and high-resolution events describe the same movement in different
-units, so do not add them together. `SYN_DROPPED` warns that events were lost.
+### Scroll diagnostics (macOS)
 
-Use the physical mouse to inspect hardware input and the OpenLogi virtual mouse
-to inspect forwarded local input, in separate terminals if needed. An exclusive
-grab by OpenLogi or hidpipe can make the physical device silent to this listener;
-stop the capturing service if a physical-device recording is needed. Diverted
-thumb-wheel input handled through HID++ may not appear in physical evdev events.
-This tool observes evdev, before libinput or application scroll processing.
+Run the passive HID event-tap listener on macOS alongside `hidpipe-client`:
 
-Record five slow upward notches, pause, then five downward notches. Also try a
-light touch, the horizontal wheel, and a fast spin to inspect unexpected events
-or direction reversals.
-
-## Scroll diagnostics (macOS)
-
-Run the passive scroll listener on the Mac alongside `hidpipe-client`:
-
-```sh
+```bash
 swift diag/scroll.swift | tee /tmp/hidpipe-scroll.log
 ```
 
-Grant the terminal Input Monitoring / Accessibility access if tap creation fails.
-The listener observes the HID event tap where hidpipe injects events, without
-changing or consuming them. Stop with Ctrl-C.
+Grant the terminal Input Monitoring / Accessibility access if tap creation fails. Each line logs arrival interval (`dt`), event timestamp, `(x, y)` deltas in lines (`line`), pixels (`point`), and fixed-point (`fixed`), continuous-scroll flags, scroll/momentum phases, source PID, and modifiers.
 
-Each event reports its arrival interval (`dt`), event timestamp, `(x,y)` deltas
-in integer lines (`line`), pixels (`point`), and fractional lines (`fixed`), plus
-continuous-scroll, scroll-phase, momentum-phase, source PID, and modifier fields.
-Source PID can help distinguish hidpipe from other injectors; PID 0 may represent
-system or hardware events and does not identify a particular physical device.
-These are macOS events after injection, not raw Linux evdev reports or measured
-application scroll distances.
+## Known limitations
 
-For a useful comparison, record five slow upward notches, pause, then five
-downward notches in remote mode. Also try the horizontal wheel and a fast spin.
-Repeat with a mouse connected directly to the Mac. Keep the same foreground app
-and note which capture used hidpipe; compare event spacing, delta sizes, signs,
-and any unexpected events after the wheel stops.
-
-## Known limitations (v0, weekend prototype)
-
-- Plain TCP, trusted LANs only. TLS is on the roadmap.
-- Media keys (volume, playback) are not mapped. They live on the HID consumer page, not the keyboard page.
-- macOS SecureEventInput: when a password field has focus, the system discards all synthetic events. This is platform policy; no injection-based tool, deskflow included, can bypass it.
-- The mouse is clamped to the main display. Multi-monitor support is on the roadmap.
-- The barrier sits on the right edge of every output. With multiple monitors, the seam between two outputs triggers it too. Per-output configuration is on the roadmap.
-- The return direction (Mac to Linux) only watches the left edge of the Mac's main display.
-- Keyboard device loss (including a keyd restart) releases remote input and exits. The systemd service restarts the server and opens the current device. A directly captured evdev mouse requires a server restart after hot-plug.
-- Side mouse buttons (back, forward) are forwarded with the OpenLogi backend; native evdev capture still forwards three buttons.
+- **Plain TCP:** Intended for trusted LANs only; TLS is on the roadmap.
+- **Media keys:** Volume and playback keys (HID Consumer Page `0x0C`) are not mapped yet; only Keyboard/Keypad Page (`0x07`) usages are forwarded.
+- **macOS `SecureEventInput`:** When a password prompt or secure text field has focus on macOS, the system discards synthetic keyboard events from user-space injectors by policy.
+- **Single-display geometry:** On Linux, the right-edge barrier is placed on every output (so seams between monitors also trigger it). On macOS, cursor movement and left-edge return detection are clamped to the main display.
+- **Device hot-plug:** Losing the keyboard device (including restarting `keyd`) releases remote input and exits so `systemd` can restart the server and reopen the device. A directly captured `evdev` mouse also requires a server restart after hot-plug.
+- **Native `evdev` side buttons:** Back and forward mouse buttons are forwarded with the OpenLogi backend; native `evdev` capture forwards left, right, and middle buttons.
 
 ## Roadmap
 
 - [ ] TLS (self-signed certificate pair, fingerprint authentication)
-- [x] nix modules: systemd user service on Linux, launchd agent on macOS
-- [ ] multi-monitor: barrier configurable per output, cursor clamping across Mac displays
-- [ ] map the Mac cursor's initial Y by screen ratio when entering remote mode
-- [ ] media keys (consumer page)
-- [ ] clipboard sync (needs careful design, may stay out)
-
-## Why edge switching came back
-
-The first draft rejected pseudo edge detection that accumulates deltas to estimate the cursor position, because it always drifts. The current implementation uses two deterministic paths instead: a layer-shell barrier on the way in (the compositor itself sends the enter event), and precise cursor clamping on the client for the way back. There is no estimation anywhere.
+- [x] Nix modules: `systemd` user service on Linux, `launchd` agent on macOS
+- [ ] Multi-monitor support: per-output barrier configuration on Linux, cursor clamping across displays on macOS
+- [ ] Map the Mac cursor's initial Y coordinate by screen height ratio when entering remote mode
+- [ ] Media keys (HID Consumer Page)
+- [ ] Clipboard sync (needs careful design, may stay out)
