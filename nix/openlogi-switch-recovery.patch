@@ -1,0 +1,126 @@
+--- a/crates/openlogi-agent-core/src/remote.rs
++++ b/crates/openlogi-agent-core/src/remote.rs
+@@ -12,7 +12,7 @@
+ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+ use std::os::unix::net::{UnixListener, UnixStream};
+ use std::path::{Path, PathBuf};
+-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+ use std::sync::mpsc::{self, SyncSender};
+ use std::sync::{Arc, Mutex, OnceLock, RwLock};
+ use std::thread;
+@@ -57,8 +57,9 @@
+     hid_ready: AtomicBool,
+     capture_active: AtomicBool,
+     capture_fault: AtomicBool,
+-    down: AtomicU8,
+-    quarantine: AtomicU8,
++    // Low byte: physical holds. High byte: remote holds awaiting release.
++    // One atomic update prevents teardown from restoring an already released hold.
++    buttons: AtomicU16,
+     routing: Mutex<Routing>,
+     local_engine: Mutex<Engine>,
+     effects: SyncSender<Effect>,
+@@ -75,8 +76,7 @@
+         hid_ready: AtomicBool::new(false),
+         capture_active: AtomicBool::new(false),
+         capture_fault: AtomicBool::new(false),
+-        down: AtomicU8::new(0),
+-        quarantine: AtomicU8::new(0),
++        buttons: AtomicU16::new(0),
+         options,
+         routing: Mutex::new(Routing::default()),
+         local_engine: Mutex::new(Engine::default()),
+@@ -262,7 +262,7 @@
+             // event and faults this lease; it cannot deliver half a local click.
+             self.capture_fault.store(false, Ordering::Release);
+             self.capture_active.store(true, Ordering::SeqCst);
+-            if self.down.load(Ordering::SeqCst) != 0 {
++            if self.buttons.load(Ordering::SeqCst) & 0xff != 0 {
+                 self.capture_active.store(false, Ordering::SeqCst);
+                 drop(routing);
+                 stream.write_all(&[1])?;
+@@ -333,17 +333,26 @@
+         }
+     }
+ 
++    fn quarantine_held(&self) {
++        // Retry against the current holds if a release races with cleanup.
++        let _ = self
++            .buttons
++            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
++                Some(state | ((state & 0xff) << 8))
++            });
++    }
++
+     fn route(&self, event: PointerEvent) -> bool {
+         let mut quarantined = false;
+         if let PointerEvent::Button { button, pressed } = event {
+-            let mask = 1u8 << button;
+-            quarantined = self.quarantine.load(Ordering::Acquire) & mask != 0;
+-            if pressed {
+-                self.down.fetch_or(mask, Ordering::SeqCst);
++            let mask = 1u16 << button;
++            let previous = if pressed {
++                self.buttons.fetch_or(mask, Ordering::SeqCst)
+             } else {
+-                self.down.fetch_and(!mask, Ordering::SeqCst);
+-                self.quarantine.fetch_and(!mask, Ordering::AcqRel);
+-            }
++                self.buttons
++                    .fetch_and(!(mask | (mask << 8)), Ordering::SeqCst)
++            };
++            quarantined = previous & (mask << 8) != 0;
+         }
+         let Ok(routing) = self.routing.try_lock() else {
+             let active = self.capture_active.load(Ordering::SeqCst);
+@@ -357,14 +366,13 @@
+                 return true;
+             }
+             lease.alive.store(false, Ordering::Release);
+-            self.quarantine
+-                .store(self.down.load(Ordering::Acquire), Ordering::Release);
++            self.quarantine_held();
+             // The current event still belongs to the failed remote session.
+             return true;
+         }
+         quarantined
+             || matches!(event, PointerEvent::GestureMotion { .. })
+-                && self.quarantine.load(Ordering::Acquire) & (1 << 5) != 0
++                && self.buttons.load(Ordering::Acquire) & (1 << 13) != 0
+     }
+ 
+     fn local(&self, event: PointerEvent) {
+@@ -390,15 +398,15 @@
+ impl Drop for CaptureGuard {
+     fn drop(&mut self) {
+         self.alive.store(false, Ordering::Release);
+-        self.bridge.capture_active.store(false, Ordering::Release);
+         if let Ok(mut routing) = self.bridge.routing.lock() {
+-            self.bridge
+-                .quarantine
+-                .store(self.bridge.down.load(Ordering::Acquire), Ordering::Release);
++            // Finish cancelling local gestures before callbacks can route locally.
++            // During cleanup, callbacks suppress input and fault the dying lease.
++            if let Ok(mut engine) = self.bridge.local_engine.lock() {
++                *engine = Engine::default();
++            }
++            self.bridge.quarantine_held();
+             routing.lease = None;
+-        }
+-        if let Ok(mut engine) = self.bridge.local_engine.lock() {
+-            *engine = Engine::default();
++            self.bridge.capture_active.store(false, Ordering::SeqCst);
+         }
+     }
+ }
+@@ -461,8 +469,7 @@
+             bridge.capture_fault.store(true, Ordering::Release);
+             // A stopped HID++ session cannot deliver releases for its controls.
+             // Native buttons remain tracked by the independent OS hook.
+-            bridge.down.fetch_and(0b0001_1111, Ordering::SeqCst);
+-            bridge.quarantine.fetch_and(0b0001_1111, Ordering::AcqRel);
++            bridge.buttons.fetch_and(0x1f1f, Ordering::SeqCst);
+             bridge.local(PointerEvent::Reset);
+             None
+         }

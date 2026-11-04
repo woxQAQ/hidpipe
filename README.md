@@ -299,8 +299,11 @@ Capture is a connection-scoped lease with a 750 ms heartbeat deadline. A held
 mouse button prevents entry. Disconnect, a stalled server, input-hook failure,
 or a full capture queue revokes the lease and restores Linux routing. Buttons
 still held at revocation are quarantined until release; pending gestures are
-cancelled without firing a click. On macOS, binding lookup happens before normal
-mouse injection, and a held button keeps its original disposition across config
+cancelled before Linux routing resumes. Physical holds and quarantine bits share
+one atomic state, so a concurrent release cannot be overwritten by lease cleanup.
+Released side buttons can begin new local clicks and gestures immediately. On
+macOS, binding lookup happens before normal mouse injection, and a held button
+keeps its original disposition across config
 or foreground-app changes. Sub-notch main-wheel motion is retained when
 high-resolution scrolling is enabled. Hardware settings
 such as DPI and SmartShift belong to the Linux profile; this bridge does not
