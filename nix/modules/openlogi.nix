@@ -44,15 +44,6 @@
         Set explicitly when multiple pointing devices are configured.
       '';
     };
-    highResolutionScroll = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Forward sub-notch movement from the Linux mouse's main wheel.
-        Disabled by default to reduce accidental scrolling on both machines.
-        The thumb wheel is unaffected.
-      '';
-    };
     mouse = lib.mkOption {
       type = lib.types.nonEmptyStr;
       default = "MX Master";
@@ -68,6 +59,5 @@
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     OPENLOGI_BRIDGE_MOUSE = cfg.openlogi.mouse;
-    OPENLOGI_BRIDGE_WHEEL_HIRES = if cfg.openlogi.highResolutionScroll then "1" else "0";
   };
 }

@@ -267,19 +267,9 @@ substring selecting exactly one physical Logitech mouse). Pass
 `--openlogi-socket <path>` to hidpipe on each machine. The agent's socket is
 local-only and versioned independently of GUI IPC.
 
-The main wheel accumulates high-resolution movement into whole notches by
-default, reducing accidental scrolling on both Linux and the remote Mac. Partial
-movement expires after 250 ms of wheel inactivity, and the virtual device keeps
-its original wheel capabilities. The thumb wheel keeps its existing resolution.
-To retain smooth high-resolution main-wheel input, set this option on the Linux
-capture machine:
-
-```nix
-services.hidpipe.openlogi.highResolutionScroll = true;
-```
-
-For manual operation, set `OPENLOGI_BRIDGE_WHEEL_HIRES=1` on the Linux agent.
-The wheel policy takes effect when that agent starts.
+The bridge preserves high-resolution wheel movement on both axes, including
+sub-notch input across pauses. The Linux virtual device keeps its original wheel
+capabilities. Scroll distance is adjusted only at the destination.
 
 On the Mac, hidpipe renders OpenLogi wheel input at 15 pixels per notch on both
 axes. To adjust the scroll distance, set the Home Manager option on the Mac
@@ -304,8 +294,7 @@ one atomic state, so a concurrent release cannot be overwritten by lease cleanup
 Released side buttons can begin new local clicks and gestures immediately. On
 macOS, binding lookup happens before normal mouse injection, and a held button
 keeps its original disposition across config
-or foreground-app changes. Sub-notch main-wheel motion is retained when
-high-resolution scrolling is enabled. Hardware settings
+or foreground-app changes. Sub-notch main-wheel motion is retained. Hardware settings
 such as DPI and SmartShift belong to the Linux profile; this bridge does not
 forward hardware actions from the Mac back to the physical device.
 
@@ -354,6 +343,18 @@ stage counts, mean durations, and maximum durations every five seconds while
 connected. Manual runs accept `--latency-stats` on both executables. Remaining
 samples are reported when the session ends normally or returns an error.
 Diagnostics are disabled by default and never log key codes or pointer contents.
+With statistics enabled, the Mac also logs `[slow-inject]` for input handling
+that takes at least 2 ms. Each record includes a process-local sequence number,
+input category, completion timestamp (`epoch_us`), total time, and time spent
+reading cached display geometry (`bounds`), acquiring input state (`state`), creating
+Quartz events (`create`), setting properties (`configure`), posting (`post`),
+and releasing events (`drop`). `other_us` covers the remaining work. These are
+wall-clock durations, including scheduling delays. Slow-record formatting is
+outside its reported total but remains part of the enclosing `client.inject`
+summary. See [the Mac injection investigation](diag/macos-injection-latency.md)
+for measurements and the passive probe. Main-display ID and bounds are queried
+at startup and refreshed on a background thread after CoreGraphics display
+configuration notifications; pointer handling reads the cached snapshot.
 
 The Linux log reports `server.queue` (enqueue to writer dequeue) and
 `server.write` (serialization and socket write). The Mac log reports

@@ -25,6 +25,9 @@
 
 #![deny(unsafe_code)]
 
+mod diagnostics;
+#[allow(unsafe_code)]
+mod display_cache;
 #[allow(unsafe_code)]
 mod event_access;
 mod table;
@@ -37,14 +40,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use core_graphics::display::CGDisplay;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
     CGScrollEventUnit, EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use display_cache::{DisplayCache, Geometry};
 
+use diagnostics::{measure, Stage};
 use hidpipe_proto as proto;
 use proto::{bridge::Resolver, ButtonState, Frame, KeyState, MouseButton, PointerEvent};
 
@@ -81,6 +85,16 @@ fn timestamp() -> String {
 
 fn main() {
     let args = Args::parse();
+    let display = DisplayCache::main_display().unwrap_or_else(|error| {
+        log!("failed to initialize display geometry: {error}");
+        std::process::exit(1);
+    });
+    let geometry = display.snapshot();
+    log!(
+        "cached main display: id={} bounds={:?}",
+        geometry.display_id,
+        geometry.bounds
+    );
     // The set of held keys is plain sendable data, shared with the signal
     // thread as a fallback; CGEventSource is not sendable, so the signal
     // thread builds its own.
@@ -116,7 +130,7 @@ fn main() {
             log!("macOS input injection access granted");
             requested_access = false;
         }
-        match session(&args, Arc::clone(&pressed)) {
+        match session(&args, Arc::clone(&pressed), display) {
             Ok(()) => log!("peer closed the connection"),
             Err(e) => log!("connection interrupted: {e}"),
         }
@@ -124,7 +138,11 @@ fn main() {
     }
 }
 
-fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
+fn session(
+    args: &Args,
+    pressed: Arc<Mutex<PressedState>>,
+    display: &'static DisplayCache,
+) -> io::Result<()> {
     let mut resolver = args
         .openlogi_socket
         .as_ref()
@@ -148,13 +166,28 @@ fn session(args: &Args, pressed: Arc<Mutex<PressedState>>) -> io::Result<()> {
         args.input_feedback,
         args.latency_stats
     );
-    let mut injector = Injector::new(args.flip_scroll, args.scroll_pixels_per_notch, pressed);
+    let mut injector = Injector::new(
+        args.flip_scroll,
+        args.scroll_pixels_per_notch,
+        pressed,
+        display,
+    );
     transport::run(
         &mut stream,
         resolver.as_mut(),
         args.input_feedback,
         args.latency_stats,
-        |frame| injector.handle(frame),
+        |frame| {
+            let kind = match frame {
+                Frame::Motion { .. } | Frame::Pointer(PointerEvent::Motion { .. }) => "motion",
+                Frame::Key { .. } => "key",
+                Frame::Button { .. } | Frame::Pointer(PointerEvent::Button { .. }) => "button",
+                Frame::Wheel { .. } | Frame::Pointer(PointerEvent::Wheel { .. }) => "wheel",
+                _ => "control",
+            };
+            let _injection = diagnostics::Injection::begin(args.latency_stats, kind);
+            injector.handle(frame)
+        },
         event_access::is_allowed,
     )
 }
@@ -170,6 +203,8 @@ struct PressedState {
 }
 
 struct Injector {
+    display: &'static DisplayCache,
+    display_geometry: Geometry,
     source: CGEventSource,
     pressed: Arc<Mutex<PressedState>>,
     flip_scroll: bool,
@@ -191,17 +226,21 @@ impl Injector {
         flip_scroll: bool,
         scroll_pixels_per_notch: u16,
         pressed: Arc<Mutex<PressedState>>,
+        display: &'static DisplayCache,
     ) -> Self {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .expect("failed to create CGEventSource; grant this program access in System Settings > Privacy & Security > Accessibility");
+        let display_geometry = display.snapshot();
         let cursor = current_location(&source).unwrap_or_else(|| {
-            let b = CGDisplay::main().bounds();
+            let b = display_geometry.bounds;
             CGPoint::new(
                 b.origin.x + b.size.width / 2.0,
                 b.origin.y + b.size.height / 2.0,
             )
         });
         Self {
+            display,
+            display_geometry,
             source,
             pressed,
             flip_scroll,
@@ -246,7 +285,7 @@ impl Injector {
             log!("unmapped HID usage ignored: {usage:#06x}");
             return;
         };
-        let mut pressed = self.pressed.lock().unwrap();
+        let mut pressed = measure(Stage::State, || self.pressed.lock().unwrap());
         // Update the modifier bitmask first, then let the event carry the
         // flags as of after the event: a modifier's press event includes
         // its own flag, its release event does not.
@@ -329,14 +368,19 @@ impl Injector {
     fn motion(&mut self, dx: i32, dy: i32) -> Option<Frame> {
         // v0 clamps to the main display only; multi-monitor is on the
         // roadmap.
-        let b = CGDisplay::main().bounds();
+        let geometry = measure(Stage::Bounds, || self.display.snapshot());
+        if geometry != self.display_geometry {
+            self.edge_pushes.clear();
+            self.display_geometry = geometry;
+        }
+        let b = geometry.bounds;
         self.cursor.x =
             (self.cursor.x + f64::from(dx)).clamp(b.origin.x, b.origin.x + b.size.width - 1.0);
         self.cursor.y =
             (self.cursor.y + f64::from(dy)).clamp(b.origin.y, b.origin.y + b.size.height - 1.0);
 
         let (held_button, mods) = {
-            let pressed = self.pressed.lock().unwrap();
+            let pressed = measure(Stage::State, || self.pressed.lock().unwrap());
             (pressed.buttons.iter().next().copied(), pressed.mods)
         };
         // Movement while a button is held must be posted as a drag event,
@@ -348,24 +392,29 @@ impl Injector {
                 CGEventType::OtherMouseDragged
             }
         });
-        let Ok(event) = CGEvent::new_mouse_event(
-            self.source.clone(),
-            event_type,
-            self.cursor,
-            CGMouseButton::Left,
-        ) else {
+        let Ok(event) = measure(Stage::Create, || {
+            CGEvent::new_mouse_event(
+                self.source.clone(),
+                event_type,
+                self.cursor,
+                CGMouseButton::Left,
+            )
+        }) else {
             return None;
         };
         // Games and other readers of relative motion look at the delta
         // fields, not the absolute position.
-        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
-        event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
-        event.set_integer_value_field(
-            EventField::MOUSE_EVENT_BUTTON_NUMBER,
-            held_button.map_or(0, |button| button as i64),
-        );
-        event.set_flags(mods);
-        event.post(CGEventTapLocation::HID);
+        measure(Stage::Configure, || {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, i64::from(dx));
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, i64::from(dy));
+            event.set_integer_value_field(
+                EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                held_button.map_or(0, |button| button as i64),
+            );
+            event.set_flags(mods);
+        });
+        measure(Stage::Post, || event.post(CGEventTapLocation::HID));
+        measure(Stage::Drop, || drop(event));
 
         // Return edge detection: while the cursor is clamped at the left
         // edge with no button held, leftward pushes enter the time window.
@@ -401,7 +450,7 @@ impl Injector {
     }
 
     fn button(&mut self, button: MouseButton, state: ButtonState) {
-        let mut pressed = self.pressed.lock().unwrap();
+        let mut pressed = measure(Stage::State, || self.pressed.lock().unwrap());
         post_button(&self.source, button, state, self.cursor, pressed.mods);
         match state {
             ButtonState::Press => {
@@ -431,13 +480,15 @@ impl Injector {
     }
 
     fn scroll_units(&self, units: CGScrollEventUnit, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
-        let Ok(event) =
+        let Ok(event) = measure(Stage::Create, || {
             CGEvent::new_scroll_event(self.source.clone(), units, wheel_count, w1, w2, w3)
-        else {
+        }) else {
             return;
         };
-        event.set_flags(self.pressed.lock().unwrap().mods);
-        event.post(CGEventTapLocation::HID);
+        let mods = measure(Stage::State, || self.pressed.lock().unwrap().mods);
+        measure(Stage::Configure, || event.set_flags(mods));
+        measure(Stage::Post, || event.post(CGEventTapLocation::HID));
+        measure(Stage::Drop, || drop(event));
     }
 
     fn release_all(&mut self) {
@@ -493,7 +544,9 @@ fn post_key(
     autorepeat: bool,
     flags: CGEventFlags,
 ) {
-    let Ok(event) = CGEvent::new_keyboard_event(source.clone(), code, down) else {
+    let Ok(event) = measure(Stage::Create, || {
+        CGEvent::new_keyboard_event(source.clone(), code, down)
+    }) else {
         log!("failed to create keyboard event: {code:#06x}");
         return;
     };
@@ -504,11 +557,14 @@ fn post_key(
     if (0x7B..=0x7E).contains(&code) {
         flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
     }
-    event.set_flags(flags);
-    if autorepeat {
-        event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
-    }
-    event.post(CGEventTapLocation::HID);
+    measure(Stage::Configure, || {
+        event.set_flags(flags);
+        if autorepeat {
+            event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
+        }
+    });
+    measure(Stage::Post, || event.post(CGEventTapLocation::HID));
+    measure(Stage::Drop, || drop(event));
 }
 
 fn post_button(
@@ -544,13 +600,17 @@ fn post_button(
             (CGEventType::OtherMouseUp, CGMouseButton::Center)
         }
     };
-    let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, position, cg_button)
-    else {
+    let Ok(event) = measure(Stage::Create, || {
+        CGEvent::new_mouse_event(source.clone(), event_type, position, cg_button)
+    }) else {
         return;
     };
-    event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
-    event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    measure(Stage::Configure, || {
+        event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, button as i64);
+        event.set_flags(flags);
+    });
+    measure(Stage::Post, || event.post(CGEventTapLocation::HID));
+    measure(Stage::Drop, || drop(event));
 }
 
 fn current_location(source: &CGEventSource) -> Option<CGPoint> {

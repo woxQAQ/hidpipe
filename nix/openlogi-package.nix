@@ -16,7 +16,6 @@ openlogi.overrideAttrs (
       ./openlogi-bridge.patch
       ./openlogi-switch-recovery.patch
       ./openlogi-managed-restart.patch
-      ./openlogi-wheel.patch
     ];
     postPatch =
       (old.postPatch or "")

@@ -37,8 +37,8 @@ fn device_named(name: &str) -> Result<Device> {
 }
 
 fn worker(stage: &str) -> Result<()> {
-    if stage.starts_with("wheel-") {
-        return wheel_worker(stage == "wheel-hires");
+    if stage == "wheel" {
+        return wheel_worker();
     }
     if stage == "busy" {
         match Hook::start(|_| EventDisposition::PassThrough) {
@@ -106,7 +106,7 @@ fn desktop_probe() -> Result<Option<(std::process::Child, mpsc::Receiver<String>
     Ok(Some((process, receiver)))
 }
 
-fn wheel_worker(hires: bool) -> Result<()> {
+fn wheel_worker() -> Result<()> {
     let (sender, receiver) = mpsc::sync_channel(32);
     let _hook = Hook::start(move |event| {
         let _ = sender.try_send(event);
@@ -136,21 +136,17 @@ fn wheel_worker(hires: bool) -> Result<()> {
             event => return Err(format!("unexpected wheel probe event: {event:?}").into()),
         }
     }
-    let expected = if hires {
-        vec![
-            (0.0, 1.0 / 120.0),
-            (0.0, 119.0 / 120.0),
-            (0.0, -1.0 / 120.0),
-            (0.0, -119.0 / 120.0),
-            (0.0, 1.0),
-            (0.5, 0.0),
-            (0.0, 0.5),
-            (0.0, 0.5),
-            (0.0, 0.5),
-        ]
-    } else {
-        vec![(0.0, 1.0), (0.0, -1.0), (0.0, 1.0), (0.5, 0.0), (0.0, 1.0)]
-    };
+    let expected = vec![
+        (0.0, 1.0 / 120.0),
+        (0.0, 119.0 / 120.0),
+        (0.0, -1.0 / 120.0),
+        (0.0, -119.0 / 120.0),
+        (0.0, 1.0),
+        (0.5, 0.0),
+        (0.0, 0.5),
+        (0.0, 0.5),
+        (0.0, 0.5),
+    ];
     if scrolls != expected {
         return Err(format!("callback wheel stream: {scrolls:?}, expected {expected:?}").into());
     }
@@ -178,27 +174,17 @@ fn wheel_worker(hires: bool) -> Result<()> {
             }
         }
     }
-    let expected = if hires {
-        vec![
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 1),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 119),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, -1),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, -119),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
-            (RelativeAxisCode::REL_HWHEEL_HI_RES.0, 60),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
-        ]
-    } else {
-        vec![
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, -120),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
-            (RelativeAxisCode::REL_HWHEEL_HI_RES.0, 60),
-            (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
-        ]
-    };
+    let expected = vec![
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, 1),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, 119),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, -1),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, -119),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, 120),
+        (RelativeAxisCode::REL_HWHEEL_HI_RES.0, 60),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
+        (RelativeAxisCode::REL_WHEEL_HI_RES.0, 60),
+    ];
     if delivered != expected {
         return Err(format!("local wheel stream: {delivered:?}, expected {expected:?}").into());
     }
@@ -241,11 +227,7 @@ fn child(stage: &str, name: &str) -> Result<Command> {
             "OPENLOGI_BRIDGE_SOCKET",
             "/tmp/hidpipe-capture-fixture.sock",
         )
-        .env("OPENLOGI_BRIDGE_MOUSE", name)
-        .env(
-            "OPENLOGI_BRIDGE_WHEEL_HIRES",
-            if stage == "wheel-hires" { "1" } else { "0" },
-        );
+        .env("OPENLOGI_BRIDGE_MOUSE", name);
     Ok(command)
 }
 
@@ -275,7 +257,7 @@ fn main() -> Result<()> {
         return Err("exclusive-grab admission regression".into());
     }
     held.ungrab()?;
-    for stage in ["capture", "wheel-discrete", "wheel-hires"] {
+    for stage in ["capture", "wheel"] {
         let mut process = child(stage, &name)?.stdout(Stdio::piped()).spawn()?;
         let stdout = process.stdout.take().ok_or("missing child output")?;
         let mut line = String::new();
@@ -284,7 +266,7 @@ fn main() -> Result<()> {
             let _ = process.wait();
             return Err("capture worker failed before readiness".into());
         }
-        if stage.starts_with("wheel-") {
+        if stage == "wheel" {
             for (axis, value) in [
                 (RelativeAxisCode::REL_WHEEL_HI_RES, 1),
                 (RelativeAxisCode::REL_WHEEL_HI_RES, 119),
@@ -299,7 +281,7 @@ fn main() -> Result<()> {
             ] {
                 fixture.emit(&[InputEvent::new(EventType::RELATIVE.0, axis.0, value)])?;
             }
-            // Stale partial movement cannot contribute to a later gesture.
+            // Sub-notch movement must survive a pause without loss or quantization.
             fixture.emit(&[InputEvent::new(
                 EventType::RELATIVE.0,
                 RelativeAxisCode::REL_WHEEL_HI_RES.0,
@@ -323,8 +305,6 @@ fn main() -> Result<()> {
             return Err(format!("{stage} capture regression").into());
         }
     }
-    println!(
-        "PASS: exclusive capture, device identity, motion, discrete and high-resolution wheel delivery"
-    );
+    println!("PASS: exclusive capture, device identity, motion and high-resolution wheel delivery");
     Ok(())
 }
