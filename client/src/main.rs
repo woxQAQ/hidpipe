@@ -82,6 +82,9 @@ fn timestamp() -> String {
 
 fn main() {
     let args = Args::parse();
+    if args.clipboard {
+        proto::clipboard::spawn_client(args.host.clone(), args.clipboard_port);
+    }
     let display = DisplayCache::main_display().unwrap_or_else(|error| {
         log!("failed to initialize display geometry: {error}");
         std::process::exit(1);
@@ -582,6 +585,8 @@ fn current_location(source: &CGEventSource) -> Option<CGPoint> {
 struct Args {
     host: String,
     port: u16,
+    clipboard: bool,
+    clipboard_port: u16,
     input_feedback: bool,
     latency_stats: bool,
     openlogi_socket: Option<std::path::PathBuf>,
@@ -595,6 +600,8 @@ Usage: hidpipe-client <server-address> [options]
 Options:
   --port <port>   server port (default 24800)
   --openlogi-socket <path>  resolve mouse input with the local OpenLogi agent
+  --clipboard    share text clipboard over a separate trusted-LAN connection
+  --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
   --input-feedback  reply to every input frame to mitigate TCP delayed ACK
   --latency-stats   log local timing summaries every 5 seconds
   -h, --help      show this help
@@ -608,6 +615,8 @@ impl Args {
         let mut args = Self {
             host: String::new(),
             port: 24800,
+            clipboard: false,
+            clipboard_port: 24801,
             input_feedback: false,
             latency_stats: false,
             openlogi_socket: None,
@@ -635,6 +644,17 @@ impl Args {
                             .into(),
                     );
                 }
+                "--clipboard" => args.clipboard = true,
+                "--clipboard-port" => {
+                    let value = it.next().unwrap_or_else(|| {
+                        eprintln!("--clipboard-port requires a value\n{USAGE}");
+                        std::process::exit(2);
+                    });
+                    args.clipboard_port = value.parse().unwrap_or_else(|_| {
+                        eprintln!("--clipboard-port is not a valid port number\n{USAGE}");
+                        std::process::exit(2);
+                    });
+                }
                 "--input-feedback" => args.input_feedback = true,
                 "--latency-stats" => args.latency_stats = true,
                 "-h" | "--help" => {
@@ -647,6 +667,10 @@ impl Args {
                 }
                 other => args.host = other.to_string(),
             }
+        }
+        if args.clipboard && args.clipboard_port == args.port {
+            eprintln!("clipboard and input ports must differ");
+            std::process::exit(2);
         }
         if args.host.is_empty() {
             eprintln!("missing server address\n{USAGE}");

@@ -40,13 +40,19 @@ in
     ++ lib.optional cfg.openlogi.enable cfg.openlogi.package;
     assertions = [
       {
+        assertion = !cfg.clipboard.enable || cfg.clipboard.port != cfg.port;
+        message = "services.hidpipe.clipboard.port must differ from services.hidpipe.port.";
+      }
+      {
         assertion = !cfg.openlogi.enable || cfg.mouse == null;
         message = "services.hidpipe.mouse must be null when OpenLogi owns mouse capture; use openlogi.mouse.";
       }
     ];
     hardware.uinput.enable = lib.mkIf cfg.openlogi.enable true;
     services.udev.packages = lib.optional cfg.openlogi.enable cfg.openlogi.package;
-    networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
+    networking.firewall.allowedTCPPorts = lib.optionals cfg.openFirewall (
+      [ cfg.port ] ++ lib.optional cfg.clipboard.enable cfg.clipboard.port
+    );
 
     systemd.services.openlogi-udev = lib.mkIf (cfg.openlogi.enable && config.services.udev.enable) {
       description = "Apply OpenLogi permissions to connected Logitech HID devices";

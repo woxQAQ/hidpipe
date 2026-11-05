@@ -32,6 +32,15 @@ in
       description = "TCP port on which to listen.";
     };
 
+    clipboard = {
+      enable = lib.mkEnableOption "bidirectional text clipboard sharing over the trusted LAN";
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 24801;
+        description = "Separate TCP port for clipboard sharing; must differ from the input port.";
+      };
+    };
+
     keyboard = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -99,6 +108,11 @@ in
         ++ lib.optionals cfg.openlogi.enable [
           "--openlogi-socket"
           cfg.openlogi.socket
+        ]
+        ++ lib.optionals cfg.clipboard.enable [
+          "--clipboard"
+          "--clipboard-port"
+          (toString cfg.clipboard.port)
         ]
         ++ lib.optional cfg.latencyStats "--latency-stats"
         ++ lib.optional cfg.swapCapsEsc "--swap-caps-esc"

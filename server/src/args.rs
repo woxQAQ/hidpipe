@@ -14,6 +14,8 @@ pub struct Args {
     /// if keyd or udev already does the swap.
     pub swap_caps_esc: bool,
     pub latency_stats: bool,
+    pub clipboard: bool,
+    pub clipboard_port: u16,
 }
 
 const USAGE: &str = "\
@@ -28,6 +30,8 @@ Options:
   --mouse <substr>     match mouse device name (default auto-detect)
   --openlogi-socket <path>  capture the mouse through an OpenLogi bridge
   --swap-caps-esc      swap caps and esc for keys sent to the remote
+  --clipboard         share text clipboard over a separate trusted-LAN connection
+  --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
   --latency-stats      log local timing summaries every 5 seconds
   -h, --help           show this help
 
@@ -45,6 +49,8 @@ impl Args {
             openlogi_socket: None,
             swap_caps_esc: false,
             latency_stats: false,
+            clipboard: false,
+            clipboard_port: 24801,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -67,6 +73,13 @@ impl Args {
                 "--openlogi-socket" => {
                     args.openlogi_socket = Some(take("--openlogi-socket").into())
                 }
+                "--clipboard" => args.clipboard = true,
+                "--clipboard-port" => {
+                    args.clipboard_port = take("--clipboard-port").parse().unwrap_or_else(|_| {
+                        eprintln!("--clipboard-port is not a valid port number\n{USAGE}");
+                        std::process::exit(2);
+                    });
+                }
                 "--latency-stats" => args.latency_stats = true,
                 "--swap-caps-esc" => args.swap_caps_esc = true,
                 "-h" | "--help" => {
@@ -78,6 +91,10 @@ impl Args {
                     std::process::exit(2);
                 }
             }
+        }
+        if args.clipboard && args.clipboard_port == args.port {
+            eprintln!("clipboard and input ports must differ");
+            std::process::exit(2);
         }
         if args.openlogi_socket.is_some() && args.mouse.is_some() {
             eprintln!("--mouse and --openlogi-socket are mutually exclusive");

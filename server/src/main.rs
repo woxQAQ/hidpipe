@@ -81,6 +81,14 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind((args.bind.as_str(), args.port))?;
     listener.set_nonblocking(true)?;
     log!("listening on {}:{}", args.bind, args.port);
+    if args.clipboard {
+        hidpipe_proto::clipboard::spawn_server(&args.bind, args.clipboard_port)?;
+        log!(
+            "clipboard listening on {}:{}",
+            args.bind,
+            args.clipboard_port
+        );
+    }
 
     let (net_tx, net_rx) = mpsc::channel::<NetMsg>();
     let mut app = App {
@@ -218,7 +226,11 @@ impl App {
                         log!(
                             "[switch] edge received: armed={} mode={} queue_us={}",
                             self.armed,
-                            if self.mode == Mode::Local { "local" } else { "remote" },
+                            if self.mode == Mode::Local {
+                                "local"
+                            } else {
+                                "remote"
+                            },
                             entered_at.elapsed().as_micros()
                         );
                     }

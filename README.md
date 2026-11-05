@@ -17,6 +17,7 @@ flowchart LR
         KD -->|raw evdev events| S[hidpipe-server<br/>EVIOCGRAB + edge switching]
         K -.->|Logitech mouse| OL_L[openlogi-agent<br/>optional pointer bridge]
         OL_L -.->|unmapped pointer events| S
+        LCB[Wayland clipboard]
     end
     subgraph Wire["wire protocol v1: no semantics"]
         S -->|"HID usage IDs + pointer frames<br/>plain TCP, TCP_NODELAY"| C
@@ -25,10 +26,12 @@ flowchart LR
         C[hidpipe-client<br/>CGEventPost @ HID tap] -.->|resolve bindings| OL_M[openlogi-agent<br/>optional macOS bindings]
         C --> SYS[system]
         KB[Karabiner] -.->|driver level, cannot see injected events| SYS
+        MCB[macOS pasteboard]
     end
+    LCB <-->|optional separate clipboard TCP channel| MCB
 ```
 
-Three design invariants:
+Three input-channel design invariants:
 
 1. **The protocol has no semantics.** Only raw HID and pointer events go on the wire. No keymap negotiation, no modifier state machine, no cache. Nothing that can drift.
 2. **Remapping happens exactly once, at a fixed place.** `keyd` on the capture side resolves stateful keyboard remaps like `overload(control, esc)` before events go on the wire, while Quartz injection on macOS bypasses driver-level keyboard remapping (such as Karabiner). With the OpenLogi backend, mouse bindings are resolved once on whichever machine currently owns the pointer.
@@ -87,6 +90,8 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `--keyboard <substr>` | auto-detect | Keyboard device name substring filter (prefers `keyd` virtual keyboard) |
 | `--mouse <substr>` | auto-detect | Mouse device name substring filter (mutually exclusive with `--openlogi-socket`) |
 | `--openlogi-socket <path>` | disabled | Capture the mouse through an OpenLogi bridge socket |
+| `--clipboard` | off | Enable bidirectional text clipboard sharing on a separate TCP connection |
+| `--clipboard-port <port>` | `24801` | Clipboard listen port (requires `--clipboard`; must differ from the input port) |
 | `--swap-caps-esc` | off | Swap Caps Lock and Escape on capture (use only when `keyd` or `udev` does not already do so) |
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds |
 
@@ -96,7 +101,26 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `--port <port>` | `24800` | Server TCP port |
 | `--openlogi-socket <path>` | disabled | Resolve mouse input with the local OpenLogi agent |
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds and `[slow-inject]` records (`>= 2 ms`) |
+| `--clipboard` | off | Enable bidirectional text clipboard sharing with the Linux server |
+| `--clipboard-port <port>` | `24801` | Server clipboard port (requires `--clipboard`; must match the server) |
 | `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
+
+## LAN clipboard sharing
+
+Enable `--clipboard` on both peers, or set the following in both the Linux and macOS service configurations:
+
+```nix
+services.hidpipe.clipboard = {
+  enable = true;
+  port = 24801; # default; independent of the input port
+};
+```
+
+Copying text on either machine updates the other machine's clipboard, including while input remains local. The clipboard is checked every 250 ms; command execution and network transfer add to this interval. Unicode, empty text, and trailing newlines are preserved. Images, files, rich text formatting, and the Wayland primary selection are not transferred. Text is limited to 1 MiB of UTF-8 bytes. Oversized local text is skipped; oversized or malformed incoming records close the clipboard connection.
+
+Clipboard transfer uses a separate TCP connection so large text does not queue behind keyboard and mouse frames. Both peers record their existing clipboard on connection and synchronize subsequent changes; connecting or reconnecting does not push old clipboard contents. Received text is not echoed back. The client retries disconnected clipboard sessions every two seconds, independently of the input connection. This channel is plaintext and unauthenticated, like the input channel: enable it only on a trusted LAN. Anyone who can reach the enabled clipboard port can read subsequent copied text and replace clipboard contents.
+
+The Linux backend requires a Wayland session and `wl-copy` / `wl-paste` from `wl-clipboard`; the Nix package includes these commands automatically. macOS uses `/usr/bin/pbcopy` and `/usr/bin/pbpaste`. With `openFirewall = true`, the NixOS module also opens the configured clipboard port when sharing is enabled. Home Manager users must open that TCP port at the system level themselves.
 
 ## NixOS and Home Manager
 
@@ -189,6 +213,8 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 | `enable` | `false` | Linux, macOS | Enable the `hidpipe` service |
 | `package` | native `hidpipe` package | Linux, macOS | Package providing `hidpipe-server` or `hidpipe-client` |
 | `port` | `24800` | Linux, macOS | TCP port used by server and client |
+| `clipboard.enable` | `false` | Linux, macOS | Enable bidirectional text clipboard sharing on the trusted LAN |
+| `clipboard.port` | `24801` | Linux, macOS | Separate clipboard TCP port; use the same value on both peers |
 | `latencyStats` | `false` | Linux, macOS | Log local latency counts, means, and maxima every 5 seconds |
 | `user` | required | NixOS | Desktop user who runs the server and receives `input` (and `uinput`) group membership |
 | `openFirewall` | `false` | NixOS | Open `services.hidpipe.port` in the firewall |

@@ -3,6 +3,8 @@
   rustPlatform,
   stdenv,
   libiconv,
+  makeWrapper,
+  wl-clipboard,
 }:
 let
   pname = if stdenv.hostPlatform.isDarwin then "hidpipe-client" else "hidpipe-server";
@@ -37,6 +39,11 @@ rustPlatform.buildRustPackage {
     "--package"
     "hidpipe-proto"
   ];
+
+  nativeBuildInputs = lib.optionals stdenv.hostPlatform.isLinux [ makeWrapper ];
+  postInstall = lib.optionalString stdenv.hostPlatform.isLinux ''
+    wrapProgram $out/bin/hidpipe-server --prefix PATH : ${lib.makeBinPath [ wl-clipboard ]}
+  '';
 
   buildInputs = lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];
 

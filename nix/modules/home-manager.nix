@@ -84,6 +84,10 @@ in
             message = "services.hidpipe.host must be set on macOS.";
           }
           {
+            assertion = !cfg.clipboard.enable || cfg.clipboard.port != cfg.port;
+            message = "services.hidpipe.clipboard.port must differ from services.hidpipe.port.";
+          }
+          {
             assertion = !cfg.openlogi.enable || cfg.mouse == null;
             message = "Use services.hidpipe.openlogi.mouse when OpenLogi owns mouse capture.";
           }
@@ -153,6 +157,11 @@ in
             ++ lib.optionals cfg.openlogi.enable [
               "--openlogi-socket"
               cfg.openlogi.socket
+            ]
+            ++ lib.optionals cfg.clipboard.enable [
+              "--clipboard"
+              "--clipboard-port"
+              (toString cfg.clipboard.port)
             ]
             ++ lib.optional cfg.inputFeedback "--input-feedback"
             ++ lib.optional cfg.latencyStats "--latency-stats";
