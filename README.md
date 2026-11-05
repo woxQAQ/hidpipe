@@ -95,8 +95,6 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `<server-address>` | required | Host name or IP address of the Linux server |
 | `--port <port>` | `24800` | Server TCP port |
 | `--openlogi-socket <path>` | disabled | Resolve mouse input with the local OpenLogi agent |
-| `--flip-scroll` | off | Reverse scroll direction |
-| `--scroll-pixels-per-notch <px>` | `15` | OpenLogi scroll distance per notch on both axes (`1–65535`) |
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds and `[slow-inject]` records (`>= 2 ms`) |
 | `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
 
@@ -163,7 +161,6 @@ On macOS, import the Home Manager module:
   services.hidpipe = {
     enable = true;
     host = "192.168.1.10";
-    # flipScroll = true;
   };
 }
 ```
@@ -202,8 +199,6 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 | `systemdTarget` | `"graphical-session.target"` | Linux | User systemd target that starts and stops the service |
 | `host` | required on macOS | macOS (HM) | Host name or IP address of the Linux server |
 | `localSigning.enable` | `true` on macOS | macOS (HM) | Install and locally sign stable app bundles in `~/Applications` |
-| `flipScroll` | `false` | macOS (HM) | Reverse scroll direction of injected mouse events |
-| `scrollPixelsPerNotch` | `15` | macOS (HM) | Pixels per wheel notch (`1–65535`) for OpenLogi mouse input on both axes |
 | `inputFeedback` | `false` | macOS (HM) | Reply with a `Pong` to each input frame to mitigate TCP delayed ACK |
 | `openlogi.enable` | `false` | Linux, macOS | Route mouse input through OpenLogi with destination-side bindings |
 | `openlogi.mouse` | `"MX Master"` | Linux | Physical Logitech mouse name substring (must match exactly one mouse) |
@@ -243,7 +238,6 @@ services.hidpipe = {
   host = "linux-host.local";
   openlogi.enable = true;
   # openlogi.device = "<Mac OpenLogi config key>";
-  # scrollPixelsPerNotch = 15;
 };
 ```
 
@@ -261,7 +255,7 @@ services.hidpipe = {
 
 ### Scroll behavior and lease semantics
 
-- **High-resolution scrolling:** The bridge preserves high-resolution wheel motion (including sub-notch accumulation across pauses) on both axes. Scroll distance is scaled only at the destination: on macOS, OpenLogi wheel input defaults to `15` pixels per notch (`scrollPixelsPerNotch` / `--scroll-pixels-per-notch`, range `1–65535`; `30` matches the previous distance). Fractional pixels are accumulated so slow scrolling stays smooth. Local Linux scrolling, native `evdev` capture, and OpenLogi bindings that emit synthetic scroll actions are unaffected.
+- **Scrolling:** Wheel input is injected as line scrolling on macOS, with one line per notch. OpenLogi's 120-unit-per-notch input is converted directly to fractional lines.
 - **Lease safety and button quarantine:** Remote pointer capture uses a connection-scoped lease with a 750 ms heartbeat deadline. A held mouse button prevents remote entry. Disconnect, a stalled server, an input-hook failure, or a full capture queue revokes the lease and restores Linux routing immediately. Buttons still held at revocation are quarantined until physical release (sharing one atomic state with physical holds so concurrent releases are never lost), and pending gestures are cancelled before local routing resumes.
 - **Hardware settings:** DPI, SmartShift, and other device-level settings belong to the Linux profile; the bridge does not forward hardware configuration changes from macOS back to the physical mouse.
 

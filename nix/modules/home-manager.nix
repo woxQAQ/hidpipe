@@ -72,22 +72,6 @@ in
         Enable for comparison with the default behavior; adds a Pong per input frame.
       '';
     };
-
-    scrollPixelsPerNotch = lib.mkOption {
-      type = lib.types.ints.between 1 65535;
-      default = 15;
-      example = 10;
-      description = ''
-        Pixels per wheel notch for OpenLogi mouse input on macOS, on both axes.
-        Lower values reduce scroll speed. Native evdev input is unaffected.
-      '';
-    };
-
-    flipScroll = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Reverse the scroll direction of injected mouse events on macOS.";
-    };
   };
 
   config = lib.mkIf cfg.enable (
@@ -165,16 +149,13 @@ in
               cfg.host
               "--port"
               (toString cfg.port)
-              "--scroll-pixels-per-notch"
-              (toString cfg.scrollPixelsPerNotch)
             ]
             ++ lib.optionals cfg.openlogi.enable [
               "--openlogi-socket"
               cfg.openlogi.socket
             ]
             ++ lib.optional cfg.inputFeedback "--input-feedback"
-            ++ lib.optional cfg.latencyStats "--latency-stats"
-            ++ lib.optional cfg.flipScroll "--flip-scroll";
+            ++ lib.optional cfg.latencyStats "--latency-stats";
             EnvironmentVariables = lib.optionalAttrs signedApps {
               HIDPIPE_SOURCE_PACKAGE = toString cfg.package;
             };

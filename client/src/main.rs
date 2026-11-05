@@ -41,8 +41,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
-    CGScrollEventUnit, EventField, ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
+    ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -56,9 +56,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// CapsLock usage ID on HID page 0x07.
 const HID_CAPS_LOCK: u16 = 0x39;
-/// Lines of scroll per wheel notch, chosen to match the scroll speed of a
-/// native mouse on macOS.
-const LINES_PER_NOTCH: i32 = 3;
 /// Return trigger: while the cursor is clamped at the left edge, control
 /// is handed back only if the accumulated leftward push within the time
 /// window exceeds the threshold. We sum over a sliding window instead of
@@ -166,12 +163,7 @@ fn session(
         args.input_feedback,
         args.latency_stats
     );
-    let mut injector = Injector::new(
-        args.flip_scroll,
-        args.scroll_pixels_per_notch,
-        pressed,
-        display,
-    );
+    let mut injector = Injector::new(pressed, display);
     transport::run(
         &mut stream,
         resolver.as_mut(),
@@ -207,8 +199,6 @@ struct Injector {
     display_geometry: Geometry,
     source: CGEventSource,
     pressed: Arc<Mutex<PressedState>>,
-    flip_scroll: bool,
-    scroll_pixels_per_notch: u16,
     /// Self-tracked cursor position. Querying the system position on every
     /// motion costs a WindowServer round trip per frame, which is measurable
     /// at 125Hz; within a session only we move the cursor, so self-tracking
@@ -218,16 +208,10 @@ struct Injector {
     /// Time window of leftward pushes while the cursor is clamped at the
     /// left edge, (timestamp, displacement).
     edge_pushes: VecDeque<(Instant, i32)>,
-    wheel_remainder: (i64, i64),
 }
 
 impl Injector {
-    fn new(
-        flip_scroll: bool,
-        scroll_pixels_per_notch: u16,
-        pressed: Arc<Mutex<PressedState>>,
-        display: &'static DisplayCache,
-    ) -> Self {
+    fn new(pressed: Arc<Mutex<PressedState>>, display: &'static DisplayCache) -> Self {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .expect("failed to create CGEventSource; grant this program access in System Settings > Privacy & Security > Accessibility");
         let display_geometry = display.snapshot();
@@ -243,11 +227,8 @@ impl Injector {
             display_geometry,
             source,
             pressed,
-            flip_scroll,
-            scroll_pixels_per_notch,
             cursor,
             edge_pushes: VecDeque::new(),
-            wheel_remainder: (0, 0),
         }
     }
 
@@ -259,7 +240,7 @@ impl Injector {
             Frame::Pointer(event) => return self.pointer(event),
             Frame::Motion { dx, dy } => return self.motion(i32::from(dx), i32::from(dy)),
             Frame::Button { button, state } => self.button(button, state),
-            Frame::Wheel { dx, dy } => self.wheel(dx, dy),
+            Frame::Wheel { dx, dy } => self.wheel(f64::from(dx), f64::from(dy)),
             Frame::ReleaseAll => self.release_all(),
             _ => {}
         }
@@ -335,29 +316,7 @@ impl Injector {
                 );
             }
             PointerEvent::Wheel { dx, dy } => {
-                // Scale 1/120-notch input to pixels, retaining fractional pixels.
-                let pixels = i64::from(self.scroll_pixels_per_notch);
-                self.wheel_remainder.0 += i64::from(dx) * pixels;
-                self.wheel_remainder.1 += i64::from(dy) * pixels;
-                let to_pixels = |value: i64| {
-                    (value / 120).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-                };
-                let (x, y) = (
-                    to_pixels(self.wheel_remainder.0),
-                    to_pixels(self.wheel_remainder.1),
-                );
-                self.wheel_remainder.0 %= 120;
-                self.wheel_remainder.1 %= 120;
-                let sign = if self.flip_scroll { -1 } else { 1 };
-                if x != 0 || y != 0 {
-                    self.scroll_units(
-                        ScrollEventUnit::PIXEL,
-                        2,
-                        y.saturating_mul(sign),
-                        x.saturating_mul(sign),
-                        0,
-                    );
-                }
+                self.wheel(f64::from(dx) / 120.0, f64::from(dy) / 120.0);
             }
             PointerEvent::Reset => self.release_all(),
             _ => {}
@@ -462,38 +421,41 @@ impl Injector {
         }
     }
 
-    fn wheel(&self, dx: i8, dy: i8) {
-        let sign = if self.flip_scroll { -1 } else { 1 };
-        // Matches the CGEventCreateScrollWheelEvent convention: the first
-        // wheel is the vertical axis with wheel_count=1; for horizontal
-        // scrolling wheel_count=2 and the value goes in the second slot.
-        if dy != 0 {
-            self.scroll(1, i32::from(dy) * LINES_PER_NOTCH * sign, 0, 0);
+    fn wheel(&self, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
         }
-        if dx != 0 {
-            self.scroll(2, 0, i32::from(dx) * LINES_PER_NOTCH * sign, 0);
-        }
-    }
-
-    fn scroll(&self, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
-        self.scroll_units(ScrollEventUnit::LINE, wheel_count, w1, w2, w3);
-    }
-
-    fn scroll_units(&self, units: CGScrollEventUnit, wheel_count: u32, w1: i32, w2: i32, w3: i32) {
         let Ok(event) = measure(Stage::Create, || {
-            CGEvent::new_scroll_event(self.source.clone(), units, wheel_count, w1, w2, w3)
+            CGEvent::new_scroll_event(
+                self.source.clone(),
+                ScrollEventUnit::LINE,
+                2,
+                dy as i32,
+                dx as i32,
+                0,
+            )
         }) else {
             return;
         };
         let mods = measure(Stage::State, || self.pressed.lock().unwrap().mods);
-        measure(Stage::Configure, || event.set_flags(mods));
+        measure(Stage::Configure, || {
+            // Quartz's fixed-point line fields retain sub-notch input directly.
+            event.set_double_value_field(
+                EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1,
+                dy,
+            );
+            event.set_double_value_field(
+                EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2,
+                dx,
+            );
+            event.set_flags(mods);
+        });
         measure(Stage::Post, || event.post(CGEventTapLocation::HID));
         measure(Stage::Drop, || drop(event));
     }
 
     fn release_all(&mut self) {
         self.edge_pushes.clear();
-        self.wheel_remainder = (0, 0);
         release_all(&self.source, &mut self.pressed.lock().unwrap());
     }
 }
@@ -622,12 +584,6 @@ struct Args {
     port: u16,
     input_feedback: bool,
     latency_stats: bool,
-    /// Reverse scroll direction. macOS's natural scrolling setting does
-    /// not affect synthetic events; if scrolling comes out reversed, use
-    /// this switch.
-    flip_scroll: bool,
-    /// Pixels per notch for OpenLogi wheel events on either axis.
-    scroll_pixels_per_notch: u16,
     openlogi_socket: Option<std::path::PathBuf>,
 }
 
@@ -641,8 +597,6 @@ Options:
   --openlogi-socket <path>  resolve mouse input with the local OpenLogi agent
   --input-feedback  reply to every input frame to mitigate TCP delayed ACK
   --latency-stats   log local timing summaries every 5 seconds
-  --flip-scroll   reverse scroll direction
-  --scroll-pixels-per-notch <pixels>  OpenLogi scroll distance (1–65535, default 15)
   -h, --help      show this help
 
 Grant this executable Accessibility access in System Settings > Privacy & Security > Accessibility.
@@ -656,8 +610,6 @@ impl Args {
             port: 24800,
             input_feedback: false,
             latency_stats: false,
-            flip_scroll: false,
-            scroll_pixels_per_notch: 15,
             openlogi_socket: None,
         };
         let mut it = std::env::args().skip(1);
@@ -683,19 +635,8 @@ impl Args {
                             .into(),
                     );
                 }
-                "--scroll-pixels-per-notch" => {
-                    args.scroll_pixels_per_notch = it
-                        .next()
-                        .and_then(|value| value.parse::<u16>().ok())
-                        .filter(|value| *value > 0)
-                        .unwrap_or_else(|| {
-                            eprintln!("--scroll-pixels-per-notch requires an integer from 1 to 65535\n{USAGE}");
-                            std::process::exit(2);
-                        });
-                }
                 "--input-feedback" => args.input_feedback = true,
                 "--latency-stats" => args.latency_stats = true,
-                "--flip-scroll" => args.flip_scroll = true,
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     std::process::exit(0);
