@@ -71,6 +71,21 @@ fn main() -> io::Result<()> {
         set_nonblocking(&mouse)?;
         Some(mouse)
     };
+    let hires_wheel = mouse.as_ref().map_or((false, false), |m| {
+        m.supported_relative_axes().map_or((false, false), |axes| {
+            (
+                axes.contains(RelativeAxisType::REL_HWHEEL_HI_RES),
+                axes.contains(RelativeAxisType::REL_WHEEL_HI_RES),
+            )
+        })
+    });
+    if mouse.is_some() {
+        log!(
+            "hi-res wheel axes: x={}, y={}",
+            hires_wheel.0,
+            hires_wheel.1
+        );
+    }
     log!(
         "keyboard: {} ({})",
         kbd.name().unwrap_or("?"),
@@ -103,6 +118,7 @@ fn main() -> io::Result<()> {
         mode: Mode::Local,
         motion: (0, 0),
         wheel: (0, 0),
+        hires_wheel,
         armed: true,
         swap_caps_esc: args.swap_caps_esc,
         latency_stats: args.latency_stats,
@@ -139,7 +155,14 @@ struct App {
     mode: Mode,
     /// Relative motion accumulated between SYN_REPORTs.
     motion: (i64, i64),
+    /// Wheel movement accumulated between SYN_REPORTs, in 1/120-notch units
+    /// (the wire unit of Frame::Wheel).
     wheel: (i64, i64),
+    /// Which wheel axes the mouse reports in high resolution, (x, y). The
+    /// kernel reports each notch of a hi-res wheel twice — ±1 on the legacy
+    /// axis and 120 units on the HI_RES axis — so the legacy axis must be
+    /// ignored whenever its HI_RES counterpart exists.
+    hires_wheel: (bool, bool),
     swap_caps_esc: bool,
     latency_stats: bool,
     listener: TcpListener,
@@ -362,11 +385,14 @@ impl App {
         if self.mode != Mode::Remote {
             return;
         }
+        let value = i64::from(value);
         match axis {
-            RelativeAxisType::REL_X => self.motion.0 += i64::from(value),
-            RelativeAxisType::REL_Y => self.motion.1 += i64::from(value),
-            RelativeAxisType::REL_WHEEL => self.wheel.1 += i64::from(value),
-            RelativeAxisType::REL_HWHEEL => self.wheel.0 += i64::from(value),
+            RelativeAxisType::REL_X => self.motion.0 += value,
+            RelativeAxisType::REL_Y => self.motion.1 += value,
+            RelativeAxisType::REL_WHEEL_HI_RES => self.wheel.1 += value,
+            RelativeAxisType::REL_HWHEEL_HI_RES => self.wheel.0 += value,
+            RelativeAxisType::REL_WHEEL if !self.hires_wheel.1 => self.wheel.1 += value * 120,
+            RelativeAxisType::REL_HWHEEL if !self.hires_wheel.0 => self.wheel.0 += value * 120,
             _ => {}
         }
     }
@@ -387,8 +413,8 @@ impl App {
         }
         if self.wheel != (0, 0) {
             let (dx, dy) = (
-                self.wheel.0.clamp(i8::MIN.into(), i8::MAX.into()) as i8,
-                self.wheel.1.clamp(i8::MIN.into(), i8::MAX.into()) as i8,
+                self.wheel.0.clamp(i32::MIN.into(), i32::MAX.into()) as i32,
+                self.wheel.1.clamp(i32::MIN.into(), i32::MAX.into()) as i32,
             );
             self.send(Frame::Wheel { dx, dy });
             self.wheel = (0, 0);

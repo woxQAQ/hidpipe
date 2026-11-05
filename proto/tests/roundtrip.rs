@@ -44,8 +44,8 @@ fn cases() -> Vec<Frame> {
             state: ButtonState::Press,
         },
         Frame::Wheel {
-            dx: i8::MIN,
-            dy: i8::MAX,
+            dx: i32::MIN,
+            dy: i32::MAX,
         },
         Frame::ReleaseAll,
         Frame::Ping,

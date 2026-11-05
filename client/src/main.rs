@@ -166,7 +166,7 @@ fn session(
         args.input_feedback,
         args.latency_stats
     );
-    let mut injector = Injector::new(pressed, display);
+    let mut injector = Injector::new(pressed, display, args.scroll);
     transport::run(
         &mut stream,
         resolver.as_mut(),
@@ -202,6 +202,8 @@ struct Injector {
     display_geometry: Geometry,
     source: CGEventSource,
     pressed: Arc<Mutex<PressedState>>,
+    /// Scroll shaping applied to every injected wheel event.
+    scroll: ScrollModifier,
     /// Self-tracked cursor position. Querying the system position on every
     /// motion costs a WindowServer round trip per frame, which is measurable
     /// at 125Hz; within a session only we move the cursor, so self-tracking
@@ -214,7 +216,11 @@ struct Injector {
 }
 
 impl Injector {
-    fn new(pressed: Arc<Mutex<PressedState>>, display: &'static DisplayCache) -> Self {
+    fn new(
+        pressed: Arc<Mutex<PressedState>>,
+        display: &'static DisplayCache,
+        scroll: ScrollModifier,
+    ) -> Self {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .expect("failed to create CGEventSource; grant this program access in System Settings > Privacy & Security > Accessibility");
         let display_geometry = display.snapshot();
@@ -230,6 +236,7 @@ impl Injector {
             display_geometry,
             source,
             pressed,
+            scroll,
             cursor,
             edge_pushes: VecDeque::new(),
         }
@@ -243,7 +250,7 @@ impl Injector {
             Frame::Pointer(event) => return self.pointer(event),
             Frame::Motion { dx, dy } => return self.motion(i32::from(dx), i32::from(dy)),
             Frame::Button { button, state } => self.button(button, state),
-            Frame::Wheel { dx, dy } => self.wheel(f64::from(dx), f64::from(dy)),
+            Frame::Wheel { dx, dy } => self.wheel(f64::from(dx) / 120.0, f64::from(dy) / 120.0),
             Frame::ReleaseAll => self.release_all(),
             _ => {}
         }
@@ -425,6 +432,7 @@ impl Injector {
     }
 
     fn wheel(&self, dx: f64, dy: f64) {
+        let (dx, dy) = self.scroll.apply(dx, dy);
         if dx == 0.0 && dy == 0.0 {
             return;
         }
@@ -582,6 +590,27 @@ fn current_location(source: &CGEventSource) -> Option<CGPoint> {
     CGEvent::new(source.clone()).ok().map(|e| e.location())
 }
 
+/// User scroll shaping, applied to every wheel event at the single
+/// injection point, whatever its source (evdev frames or the OpenLogi
+/// bridge). Inversion is kept separate from scale so both stay easy to
+/// reason about; a negative scale is expressed as invert plus its
+/// magnitude.
+#[derive(Clone, Copy)]
+struct ScrollModifier {
+    scale_x: f64,
+    scale_y: f64,
+    invert_x: bool,
+    invert_y: bool,
+}
+
+impl ScrollModifier {
+    fn apply(&self, dx: f64, dy: f64) -> (f64, f64) {
+        let sign_x = if self.invert_x { -1.0 } else { 1.0 };
+        let sign_y = if self.invert_y { -1.0 } else { 1.0 };
+        (dx * sign_x * self.scale_x, dy * sign_y * self.scale_y)
+    }
+}
+
 struct Args {
     host: String,
     port: u16,
@@ -590,6 +619,7 @@ struct Args {
     input_feedback: bool,
     latency_stats: bool,
     openlogi_socket: Option<std::path::PathBuf>,
+    scroll: ScrollModifier,
 }
 
 const USAGE: &str = "\
@@ -604,6 +634,10 @@ Options:
   --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
   --input-feedback  reply to every input frame to mitigate TCP delayed ACK
   --latency-stats   log local timing summaries every 5 seconds
+  --invert-scroll-x   flip horizontal scroll direction
+  --invert-scroll-y   flip vertical scroll direction
+  --scroll-scale-x <f>  multiply horizontal scroll speed (default 1.0)
+  --scroll-scale-y <f>  multiply vertical scroll speed (default 1.0)
   -h, --help      show this help
 
 Grant this executable Accessibility access in System Settings > Privacy & Security > Accessibility.
@@ -620,6 +654,12 @@ impl Args {
             input_feedback: false,
             latency_stats: false,
             openlogi_socket: None,
+            scroll: ScrollModifier {
+                scale_x: 1.0,
+                scale_y: 1.0,
+                invert_x: false,
+                invert_y: false,
+            },
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -657,6 +697,14 @@ impl Args {
                 }
                 "--input-feedback" => args.input_feedback = true,
                 "--latency-stats" => args.latency_stats = true,
+                "--invert-scroll-x" => args.scroll.invert_x = true,
+                "--invert-scroll-y" => args.scroll.invert_y = true,
+                "--scroll-scale-x" => {
+                    args.scroll.scale_x = parse_scale("--scroll-scale-x", it.next());
+                }
+                "--scroll-scale-y" => {
+                    args.scroll.scale_y = parse_scale("--scroll-scale-y", it.next());
+                }
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     std::process::exit(0);
@@ -678,4 +726,20 @@ impl Args {
         }
         args
     }
+}
+
+fn parse_scale(flag: &str, value: Option<String>) -> f64 {
+    let value = value.unwrap_or_else(|| {
+        eprintln!("{flag} requires a value\n{USAGE}");
+        std::process::exit(2);
+    });
+    let scale = value.parse::<f64>().unwrap_or_else(|_| {
+        eprintln!("{flag} is not a number\n{USAGE}");
+        std::process::exit(2);
+    });
+    if !scale.is_finite() || scale < 0.0 {
+        eprintln!("{flag} must be a finite, non-negative number\n{USAGE}");
+        std::process::exit(2);
+    }
+    scale
 }

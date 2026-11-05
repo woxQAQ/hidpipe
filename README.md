@@ -281,7 +281,7 @@ services.hidpipe = {
 
 ### Scroll behavior and lease semantics
 
-- **Scrolling:** Wheel input is injected as line scrolling on macOS, with one line per notch. OpenLogi's 120-unit-per-notch input is converted directly to fractional lines.
+- **Scrolling:** The wire carries wheel deltas in 1/120-notch units on both backends. On the evdev path the server reads `REL_WHEEL_HI_RES`/`REL_HWHEEL_HI_RES` when the device offers them (ignoring the legacy ±1-per-notch axis so a notch is not counted twice) and scales plain `REL_WHEEL` up by 120 otherwise. On macOS, wheel input is injected as line scrolling — one line per notch — through Quartz's fixed-point fields, so sub-notch hi-res input stays smooth. `--invert-scroll-x/-y` and `--scroll-scale-x/-y` shape scrolling at the injection point for both backends.
 - **Lease safety and button quarantine:** Remote pointer capture uses a connection-scoped lease with a 750 ms heartbeat deadline. A held mouse button prevents remote entry. Disconnect, a stalled server, an input-hook failure, or a full capture queue revokes the lease and restores Linux routing immediately. Buttons still held at revocation are quarantined until physical release (sharing one atomic state with physical holds so concurrent releases are never lost), and pending gestures are cancelled before local routing resumes.
 - **Hardware settings:** DPI, SmartShift, and other device-level settings belong to the Linux profile; the bridge does not forward hardware configuration changes from macOS back to the physical mouse.
 

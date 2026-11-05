@@ -23,7 +23,7 @@ pub use pointer::PointerEvent;
 
 /// Protocol version, carried in the handshake. A mismatch is rejected
 /// instead of silently misinterpreting frames.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame {
@@ -48,10 +48,12 @@ pub enum Frame {
         state: ButtonState,
     },
     /// Wheel. dy > 0 means the wheel moves away from the user (content
-    /// scrolls up).
+    /// scrolls up). Units are 1/120 of a notch, the same convention as
+    /// `PointerEvent::Wheel`, so high-resolution wheels keep sub-notch
+    /// precision on the wire.
     Wheel {
-        dx: i8,
-        dy: i8,
+        dx: i32,
+        dy: i32,
     },
     /// Ask the peer to release all held keys and buttons. Sent before
     /// switching back to local or disconnecting, so no modifiers get stuck
@@ -112,7 +114,8 @@ pub const fn payload_len(tag: u8) -> Option<usize> {
         TAG_HELLO => Some(2),
         TAG_KEY => Some(3),
         TAG_MOTION => Some(4),
-        TAG_BUTTON | TAG_WHEEL => Some(2),
+        TAG_BUTTON => Some(2),
+        TAG_WHEEL => Some(8),
         TAG_RELEASE_ALL | TAG_PING | TAG_PONG | TAG_RETURN_TO_LOCAL => Some(0),
         TAG_POINTER => Some(pointer::RECORD_SIZE),
         _ => None,
@@ -134,7 +137,11 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             out.extend(dy.to_be_bytes());
         }
         Frame::Button { button, state } => out.extend([TAG_BUTTON, button as u8, state as u8]),
-        Frame::Wheel { dx, dy } => out.extend([TAG_WHEEL, dx as u8, dy as u8]),
+        Frame::Wheel { dx, dy } => {
+            out.push(TAG_WHEEL);
+            out.extend(dx.to_be_bytes());
+            out.extend(dy.to_be_bytes());
+        }
         Frame::ReleaseAll => out.push(TAG_RELEASE_ALL),
         Frame::Ping => out.push(TAG_PING),
         Frame::Pong => out.push(TAG_PONG),
@@ -187,8 +194,8 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<Frame> {
             },
         },
         TAG_WHEEL => Frame::Wheel {
-            dx: payload[0] as i8,
-            dy: payload[1] as i8,
+            dx: i32::from_be_bytes(payload[0..4].try_into().ok()?),
+            dy: i32::from_be_bytes(payload[4..8].try_into().ok()?),
         },
         TAG_RELEASE_ALL => Frame::ReleaseAll,
         TAG_PING => Frame::Ping,
