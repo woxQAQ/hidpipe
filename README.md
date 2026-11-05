@@ -9,8 +9,7 @@ It fixes three structural problems of the deskflow/synergy family:
 3. Weak failure recovery. No heartbeat-based self-healing, no safety valve against stuck keys.
 
 > [!WARNING]
-> This project is not a universal solution about device sharing in the LAN,
-> for this purpose, Deskflow, synergy may be a good choice.
+> As you can see, I make many hypothesis such as openlogi/keyd, niri, wayland and Logitech device. This project is not a universal solution about device sharing in the LAN, and cannot running well in any other case.
 > 
 > This just a vibe project that fit my requirements.
 
