@@ -24,7 +24,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use evdev::{Device, InputEventKind, Key, RelativeAxisType};
 use hidpipe_proto::{bridge::Capture, ButtonState, Frame, KeyState, MouseButton};
@@ -88,6 +88,7 @@ fn main() -> io::Result<()> {
         mouse,
         openlogi_socket: args.openlogi_socket,
         capture: None,
+        first_pointer_since: None,
         conn: None,
         pending: None,
         conn_id: 0,
@@ -118,6 +119,8 @@ struct App {
     mouse: Option<Device>,
     openlogi_socket: Option<PathBuf>,
     capture: Option<Capture>,
+    /// Edge timestamp retained until the first captured pointer event is forwarded.
+    first_pointer_since: Option<Instant>,
     /// Connection that passed the handshake and is now serving.
     conn: Option<Connection>,
     /// Freshly accepted connection that has not passed the handshake yet.
@@ -210,10 +213,18 @@ impl App {
         }
         for event in events {
             match event {
-                BarrierEvent::Enter => {
+                BarrierEvent::Enter(entered_at) => {
+                    if self.latency_stats {
+                        log!(
+                            "[switch] edge received: armed={} mode={} queue_us={}",
+                            self.armed,
+                            if self.mode == Mode::Local { "local" } else { "remote" },
+                            entered_at.elapsed().as_micros()
+                        );
+                    }
                     if self.armed && self.mode == Mode::Local {
                         self.armed = false;
-                        self.enter_remote();
+                        self.enter_remote(entered_at);
                     }
                 }
                 BarrierEvent::Leave => self.armed = true,
@@ -256,6 +267,12 @@ impl App {
                 }
             }
             for event in events {
+                if let Some(entered_at) = self.first_pointer_since.take() {
+                    log!(
+                        "[switch] first pointer queued: edge_to_pointer_us={}",
+                        entered_at.elapsed().as_micros()
+                    );
+                }
                 self.send(Frame::Pointer(event));
             }
             if let Some(e) = failure {
@@ -366,11 +383,12 @@ impl App {
         }
     }
 
-    fn enter_remote(&mut self) {
+    fn enter_remote(&mut self, entered_at: Instant) {
         if self.conn.is_none() {
             log!("no client connected, staying local");
             return;
         }
+        let setup_started = Instant::now();
         let setup = (|| -> io::Result<()> {
             self.kbd.grab()?;
             if let Some(path) = self.openlogi_socket.as_ref() {
@@ -386,6 +404,14 @@ impl App {
             return;
         }
         self.mode = Mode::Remote;
+        if self.latency_stats {
+            self.first_pointer_since = self.openlogi_socket.as_ref().map(|_| entered_at);
+            log!(
+                "[switch] capture ready: setup_us={} edge_to_capture_us={}",
+                setup_started.elapsed().as_micros(),
+                entered_at.elapsed().as_micros()
+            );
+        }
         log!("-> remote mode: input goes to macOS");
     }
 
@@ -400,6 +426,7 @@ impl App {
     }
 
     fn ungrab_all(&mut self) {
+        self.first_pointer_since = None;
         self.capture = None;
         let _ = self.kbd.ungrab();
         if let Some(mouse) = self.mouse.as_mut() {

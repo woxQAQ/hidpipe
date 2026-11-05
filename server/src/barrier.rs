@@ -1,5 +1,6 @@
-//! Wayland edge barrier: a 1px fully transparent layer-shell surface on the
-//! right edge of every output. When the pointer enters, the compositor sends
+//! Wayland edge barrier: a fully transparent layer-shell surface with a 1px
+//! strip inside the right edge of every output and padding outside it. When the
+//! pointer enters, the compositor sends
 //! a pointer enter event. This is precise, protocol-backed edge detection
 //! instead of delta-accumulation cursor estimation, so it cannot drift.
 //!
@@ -13,7 +14,7 @@ use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
@@ -22,9 +23,15 @@ use wayland_client::protocol::{
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
+// The output space may be ceiled while layer-shell geometry is rounded.
+// Extend outward by one logical pixel so the clamped pointer still hits the
+// surface under fractional scaling, without widening the strip inside it.
+const EDGE_PADDING: i32 = 1;
+const BARRIER_WIDTH: i32 = 1 + EDGE_PADDING;
+
 #[derive(Debug, Clone, Copy)]
 pub enum BarrierEvent {
-    Enter,
+    Enter(Instant),
     Leave,
 }
 
@@ -120,11 +127,12 @@ impl State {
                 (),
             );
             use zwlr_layer_surface_v1::Anchor;
-            // Anchor to the right edge and stretch top to bottom; 1px wide.
-            // No exclusive space, no keyboard focus.
+            // Keep one pixel inside the output and cover rounding at its edge.
+            // Ignore reserved zones so the barrier follows the output boundary.
             layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Right);
-            layer.set_size(1, 0);
-            layer.set_exclusive_zone(0);
+            layer.set_size(BARRIER_WIDTH as u32, 0);
+            layer.set_margin(0, -EDGE_PADDING, 0, 0);
+            layer.set_exclusive_zone(-1);
             layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
             surface.commit();
             self.barriers.push(Barrier {
@@ -150,11 +158,20 @@ fn make_transparent_buffer(
     qh: &QueueHandle<State>,
 ) -> Result<(File, wl_buffer::WlBuffer), Box<dyn Error>> {
     let height = height.max(1);
-    let size = u64::from(height) * 4; // 1px wide, ARGB8888
+    let stride = BARRIER_WIDTH * 4; // ARGB8888
+    let size = u64::from(height) * stride as u64;
     let file = unlinked_tempfile()?;
     file.set_len(size)?;
     let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
-    let buffer = pool.create_buffer(0, 1, height as i32, 4, wl_shm::Format::Argb8888, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        BARRIER_WIDTH,
+        height as i32,
+        stride,
+        wl_shm::Format::Argb8888,
+        qh,
+        (),
+    );
     Ok((file, buffer))
 }
 
@@ -249,7 +266,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     ) {
         match event {
             wl_pointer::Event::Enter { surface, .. } if state.is_barrier(&surface) => {
-                let _ = state.tx.send(BarrierEvent::Enter);
+                let _ = state.tx.send(BarrierEvent::Enter(Instant::now()));
             }
             wl_pointer::Event::Leave { surface, .. } if state.is_barrier(&surface) => {
                 let _ = state.tx.send(BarrierEvent::Leave);
