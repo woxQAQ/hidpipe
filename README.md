@@ -8,6 +8,10 @@ It fixes three structural problems of the deskflow/synergy family:
 2. Latency. The translation layer and event loop queuing add delay.
 3. Weak failure recovery. No heartbeat-based self-healing, no safety valve against stuck keys.
 
+> [WARNING] This project is not a universal solution about device shared in the LAN,
+> for this purpose, Deskflow, synergy may be a good choice.
+> This just a vibe project that fit my requirements.
+
 ## Architecture
 
 ```mermaid
