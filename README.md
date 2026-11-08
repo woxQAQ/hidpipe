@@ -109,6 +109,10 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `--clipboard` | off | Enable bidirectional text clipboard sharing with the Linux server |
 | `--clipboard-port <port>` | `24801` | Server clipboard port (requires `--clipboard`; must match the server) |
 | `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
+| `--scroll-scale-x <f>` | `1.0` | Multiply horizontal Wheel input by a finite, non-negative value; `0` disables this axis |
+| `--scroll-scale-y <f>` | `1.0` | Multiply vertical Wheel input by a finite, non-negative value; `0` disables this axis |
+| `--invert-scroll-x` | off | Reverse horizontal Wheel input |
+| `--invert-scroll-y` | off | Reverse vertical Wheel input |
 
 ## LAN clipboard sharing
 
@@ -196,6 +200,19 @@ On macOS, import the Home Manager module:
 
 This creates a `launchd` agent in the graphical login session (`~/Library/Logs/hidpipe.log`). The client checks event-posting permission before connecting and waits until access is granted; revoking access closes the connection on the next heartbeat and releases Linux input.
 
+To tune ordinary Wheel input on the Mac, for example:
+
+```nix
+services.hidpipe.scroll = {
+  scaleX = 1.0;
+  scaleY = 0.5;
+  invertX = false;
+  invertY = false;
+};
+```
+
+Here `0.5` is a personal tuning example; both axes default to `1.0`. Scales accept finite, non-negative integers or floats, and `0` disables an axis. These Home Manager options affect macOS injection only and add no Linux server flags. HID++ thumbwheel actions remain controlled by the Mac OpenLogi profile's sensitivity and bindings.
+
 #### Persistent local signing on macOS
 
 By default (`services.hidpipe.localSigning.enable = true`), Home Manager installs application bundles at `~/Applications/Hidpipe.app` (and `~/Applications/OpenLogi Agent.app` when OpenLogi is enabled). During activation—outside the Nix build sandbox—it signs them using a persistent certificate stored in a dedicated local Keychain under `~/Library/Application Support/hidpipe/signing` (`0700`). The private key never enters the Nix store, and the login Keychain does not need to be unlocked over SSH.
@@ -231,6 +248,10 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 | `host` | required on macOS | macOS (HM) | Host name or IP address of the Linux server |
 | `localSigning.enable` | `true` on macOS | macOS (HM) | Install and locally sign stable app bundles in `~/Applications` |
 | `inputFeedback` | `false` | macOS (HM) | Reply with a `Pong` to each input frame to mitigate TCP delayed ACK |
+| `scroll.scaleX` | `1.0` | macOS (HM) | Finite, non-negative horizontal Wheel multiplier (integer or float); `0` disables this axis |
+| `scroll.scaleY` | `1.0` | macOS (HM) | Finite, non-negative vertical Wheel multiplier (integer or float); `0` disables this axis |
+| `scroll.invertX` | `false` | macOS (HM) | Reverse horizontal Wheel input; excludes HID++ thumbwheel actions |
+| `scroll.invertY` | `false` | macOS (HM) | Reverse vertical Wheel input; excludes HID++ thumbwheel actions |
 | `openlogi.enable` | `false` | Linux, macOS | Route mouse input through OpenLogi with destination-side bindings |
 | `openlogi.mouse` | `"MX Master"` | Linux | Physical Logitech mouse name substring (must match exactly one mouse) |
 | `openlogi.device` | `null` | Linux, macOS | OpenLogi config key (`null` selects the first online device on Linux or saved selection on macOS) |
@@ -286,7 +307,8 @@ services.hidpipe = {
 
 ### Scroll behavior and lease semantics
 
-- **Scrolling:** The wire carries wheel deltas in 1/120-notch units on both backends. On the evdev path the server reads `REL_WHEEL_HI_RES`/`REL_HWHEEL_HI_RES` when the device offers them (ignoring the legacy ±1-per-notch axis so a notch is not counted twice) and scales plain `REL_WHEEL` up by 120 otherwise. On macOS, wheel input is injected as line scrolling — one line per notch — through Quartz's fixed-point fields, so sub-notch hi-res input stays smooth. `--invert-scroll-x/-y` and `--scroll-scale-x/-y` shape scrolling at the injection point for both backends.
+- **Ordinary Wheel input:** The wire carries wheel deltas in 1/120-notch units on both backends. On the evdev path the server reads `REL_WHEEL_HI_RES`/`REL_HWHEEL_HI_RES` when the device offers them (ignoring the legacy ±1-per-notch axis so a notch is not counted twice) and scales plain `REL_WHEEL` up by 120 otherwise. On macOS, ordinary evdev Wheel and OpenLogi `PointerEvent::Wheel` input is injected as precise PIXEL scrolling, mapping one notch to ten Quartz points before scale/invert. Each connection accumulates signed subpixel remainder independently per axis, truncating toward zero; for example, four raw deltas of 30 emit 2, 3, 2, 3 points at default scale. No event is emitted until an axis has a whole point. ReleaseAll, pointer reset, disconnect and reconnect discard remainder. Finite scaling that exceeds the injectable i32 range saturates and discards excess, without retaining a compensation queue. Ten points is a destination mapping baseline, not a guarantee of identical screen movement in every application. `--invert-scroll-x/-y` and `--scroll-scale-x/-y` (Home Manager: `scroll.invertX/invertY` and `scroll.scaleX/scaleY`) adjust this Wheel input at the Mac injection point.
+- **HID++ thumbwheel:** OpenLogi resolves thumbwheel actions through the destination profile and injects its `Effect::Scroll` directly. The CLI and Home Manager Wheel modifiers above do not affect this path; tune sensitivity and bindings in the Mac OpenLogi profile.
 - **Lease safety and button quarantine:** Remote pointer capture uses a connection-scoped lease with a 750 ms heartbeat deadline. A held mouse button prevents remote entry. Disconnect, a stalled server, an input-hook failure, or a full capture queue revokes the lease and restores Linux routing immediately. Buttons still held at revocation are quarantined until physical release (sharing one atomic state with physical holds so concurrent releases are never lost), and pending gestures are cancelled before local routing resumes.
 - **Hardware settings:** DPI, SmartShift, and other device-level settings belong to the Linux profile; the bridge does not forward hardware configuration changes from macOS back to the physical mouse.
 
@@ -313,12 +335,14 @@ This replies with one `Pong` frame per input frame before local resolution or in
 
 ### Scroll diagnostics (Linux)
 
+The following scroll diagnostic commands work in Nushell.
+
 Build and run the passive `evdev` wheel listener (never grabs the device or injects input):
 
-```bash
+```nu
 cargo build -p hidpipe-server --example scroll
 sudo target/debug/examples/scroll --list
-sudo target/debug/examples/scroll /dev/input/eventN | tee /tmp/hidpipe-scroll-linux.log
+sudo target/debug/examples/scroll /dev/input/eventN | tee { save --force /tmp/hidpipe-scroll-linux.log }
 ```
 
 Each output line represents one wheel-containing `SYN_REPORT` frame with elapsed time, kernel timestamp, interval since the previous wheel frame (`dt`), and raw wheel events (`REL_WHEEL`, `REL_HWHEEL`, and their `HI_RES` variants at 120 units per notch). Stop `openlogi-agent` or `hidpipe-server` first if an exclusive grab silences the physical device.
@@ -327,11 +351,19 @@ Each output line represents one wheel-containing `SYN_REPORT` frame with elapsed
 
 Run the passive HID event-tap listener on macOS alongside `hidpipe-client`:
 
-```bash
-swift diag/scroll.swift | tee /tmp/hidpipe-scroll.log
+```nu
+swift diag/scroll.swift | tee { save --force /tmp/hidpipe-scroll.log }
 ```
 
 Grant the terminal Input Monitoring / Accessibility access if tap creation fails. Each line logs arrival interval (`dt`), event timestamp, `(x, y)` deltas in lines (`line`), pixels (`point`), and fixed-point (`fixed`), continuous-scroll flags, scroll/momentum phases, source PID, and modifiers.
+
+For explicit assertions, use `scroll-verify.swift` with the test executable PID. Point mode checks cumulative point deltas and every event's continuous field; omit event count when subpixel accumulation changes the number of emitted events:
+
+```nu
+swift diag/scroll-verify.swift --pid $client_pid --axis y --expected-point 10 --expected-continuous 1 --timeout-seconds 15
+```
+
+The old `--expected-fixed` plus `--expected-count` mode remains available for historical LINE-event reproduction. See [the validation procedure](diag/scroll-validation.md) for fixture sequencing, expected point totals, native test evidence, and outstanding application observations.
 
 ## Known limitations
 

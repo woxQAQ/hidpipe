@@ -8,6 +8,11 @@ let
   cfg = config.services.hidpipe;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
   server = import ./server.nix { inherit lib pkgs cfg; };
+  # Reject NaN (which is unequal to itself) and bound floats by the largest
+  # finite f64 accepted by the client.
+  scrollScaleType = lib.types.addCheck (lib.types.either lib.types.int lib.types.float) (
+    value: value == value && value >= 0 && value <= 1.7976931348623157e308
+  );
   signedApps = isDarwin && cfg.localSigning.enable;
   applicationsDirectory = "${config.home.homeDirectory}/Applications";
   signingDirectory = "${config.home.homeDirectory}/Library/Application Support/hidpipe/signing";
@@ -62,6 +67,43 @@ in
       type = lib.types.port;
       default = 24800;
       description = "TCP port used by the server and client.";
+    };
+
+    scroll = {
+      scaleX = lib.mkOption {
+        type = scrollScaleType;
+        default = 1.0;
+        description = ''
+          Finite, non-negative horizontal Wheel multiplier for macOS injection.
+          Zero disables this axis. HID++ thumbwheel actions use the destination
+          OpenLogi profile instead. Has no effect on the Linux server.
+        '';
+      };
+      scaleY = lib.mkOption {
+        type = scrollScaleType;
+        default = 1.0;
+        description = ''
+          Finite, non-negative vertical Wheel multiplier for macOS injection.
+          Zero disables this axis. HID++ thumbwheel actions use the destination
+          OpenLogi profile instead. Has no effect on the Linux server.
+        '';
+      };
+      invertX = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Invert horizontal Wheel input on macOS. Does not affect HID++
+          thumbwheel actions or the Linux server.
+        '';
+      };
+      invertY = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Invert vertical Wheel input on macOS. Does not affect HID++
+          thumbwheel actions or the Linux server.
+        '';
+      };
     };
 
     inputFeedback = lib.mkOption {
@@ -164,7 +206,17 @@ in
               (toString cfg.clipboard.port)
             ]
             ++ lib.optional cfg.inputFeedback "--input-feedback"
-            ++ lib.optional cfg.latencyStats "--latency-stats";
+            ++ lib.optional cfg.latencyStats "--latency-stats"
+            ++ lib.optionals (cfg.scroll.scaleX != 1.0) [
+              "--scroll-scale-x"
+              (builtins.toJSON cfg.scroll.scaleX)
+            ]
+            ++ lib.optionals (cfg.scroll.scaleY != 1.0) [
+              "--scroll-scale-y"
+              (builtins.toJSON cfg.scroll.scaleY)
+            ]
+            ++ lib.optional cfg.scroll.invertX "--invert-scroll-x"
+            ++ lib.optional cfg.scroll.invertY "--invert-scroll-y";
             EnvironmentVariables = lib.optionalAttrs signedApps {
               HIDPIPE_SOURCE_PACKAGE = toString cfg.package;
             };

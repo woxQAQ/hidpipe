@@ -30,6 +30,7 @@ mod diagnostics;
 mod display_cache;
 #[allow(unsafe_code)]
 mod event_access;
+mod scroll;
 mod table;
 mod transport;
 
@@ -42,7 +43,6 @@ use std::time::{Duration, Instant};
 
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
-    ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -51,6 +51,7 @@ use display_cache::{DisplayCache, Geometry};
 use diagnostics::{measure, Stage};
 use hidpipe_proto as proto;
 use proto::{bridge::Resolver, ButtonState, Frame, KeyState, MouseButton, PointerEvent};
+use scroll::{Scroll, ScrollModifier};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -203,7 +204,7 @@ struct Injector {
     source: CGEventSource,
     pressed: Arc<Mutex<PressedState>>,
     /// Scroll shaping applied to every injected wheel event.
-    scroll: ScrollModifier,
+    scroll: Scroll,
     /// Self-tracked cursor position. Querying the system position on every
     /// motion costs a WindowServer round trip per frame, which is measurable
     /// at 125Hz; within a session only we move the cursor, so self-tracking
@@ -236,7 +237,7 @@ impl Injector {
             display_geometry,
             source,
             pressed,
-            scroll,
+            scroll: Scroll::new(scroll),
             cursor,
             edge_pushes: VecDeque::new(),
         }
@@ -250,7 +251,7 @@ impl Injector {
             Frame::Pointer(event) => return self.pointer(event),
             Frame::Motion { dx, dy } => return self.motion(i32::from(dx), i32::from(dy)),
             Frame::Button { button, state } => self.button(button, state),
-            Frame::Wheel { dx, dy } => self.wheel(f64::from(dx) / 120.0, f64::from(dy) / 120.0),
+            Frame::Wheel { .. } => self.wheel(&frame),
             Frame::ReleaseAll => self.release_all(),
             _ => {}
         }
@@ -325,9 +326,7 @@ impl Injector {
                     },
                 );
             }
-            PointerEvent::Wheel { dx, dy } => {
-                self.wheel(f64::from(dx) / 120.0, f64::from(dy) / 120.0);
-            }
+            PointerEvent::Wheel { .. } => self.wheel(&Frame::Pointer(event)),
             PointerEvent::Reset => self.release_all(),
             _ => {}
         }
@@ -431,41 +430,19 @@ impl Injector {
         }
     }
 
-    fn wheel(&self, dx: f64, dy: f64) {
-        let (dx, dy) = self.scroll.apply(dx, dy);
-        if dx == 0.0 && dy == 0.0 {
-            return;
-        }
-        let Ok(event) = measure(Stage::Create, || {
-            CGEvent::new_scroll_event(
-                self.source.clone(),
-                ScrollEventUnit::LINE,
-                2,
-                dy as i32,
-                dx as i32,
-                0,
-            )
-        }) else {
+    fn wheel(&mut self, frame: &Frame) {
+        let mods = measure(Stage::State, || self.pressed.lock().unwrap().mods);
+        let Ok(Some(event)) = self.scroll.event(&self.source, frame, mods) else {
             return;
         };
-        let mods = measure(Stage::State, || self.pressed.lock().unwrap().mods);
-        measure(Stage::Configure, || {
-            // Quartz's fixed-point line fields retain sub-notch input directly.
-            event.set_double_value_field(
-                EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1,
-                dy,
-            );
-            event.set_double_value_field(
-                EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2,
-                dx,
-            );
-            event.set_flags(mods);
-        });
         measure(Stage::Post, || event.post(CGEventTapLocation::HID));
         measure(Stage::Drop, || drop(event));
     }
 
     fn release_all(&mut self) {
+        let _ = self
+            .scroll
+            .event(&self.source, &Frame::ReleaseAll, CGEventFlags::empty());
         self.edge_pushes.clear();
         release_all(&self.source, &mut self.pressed.lock().unwrap());
     }
@@ -588,27 +565,6 @@ fn post_button(
 
 fn current_location(source: &CGEventSource) -> Option<CGPoint> {
     CGEvent::new(source.clone()).ok().map(|e| e.location())
-}
-
-/// User scroll shaping, applied to every wheel event at the single
-/// injection point, whatever its source (evdev frames or the OpenLogi
-/// bridge). Inversion is kept separate from scale so both stay easy to
-/// reason about; a negative scale is expressed as invert plus its
-/// magnitude.
-#[derive(Clone, Copy)]
-struct ScrollModifier {
-    scale_x: f64,
-    scale_y: f64,
-    invert_x: bool,
-    invert_y: bool,
-}
-
-impl ScrollModifier {
-    fn apply(&self, dx: f64, dy: f64) -> (f64, f64) {
-        let sign_x = if self.invert_x { -1.0 } else { 1.0 };
-        let sign_y = if self.invert_y { -1.0 } else { 1.0 };
-        (dx * sign_x * self.scale_x, dy * sign_y * self.scale_y)
-    }
 }
 
 struct Args {
