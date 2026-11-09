@@ -1,0 +1,62 @@
+--- a/crates/openlogi-hid/src/gesture.rs
++++ b/crates/openlogi-hid/src/gesture.rs
+@@ -231,7 +231,26 @@
+     if raw_input {
+         let _ = sink.send(CapturedInput::Ready);
+     }
+-    let _ = shutdown.await;
++    // Firmware can forget temporary diversion without changing the device's
++    // route or ending this task. Verify the device, not just task liveness.
++    let reporting_lost = async {
++        loop {
++            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
++            if !armed.reporting_matches().await? {
++                return Ok::<(), v20::Hidpp20Error>(());
++            }
++        }
++    };
++    tokio::select! {
++        _ = shutdown => {}
++        result = reporting_lost => {
++            match result {
++                Ok(()) => warn!(index = device_index, "control reporting lost; restarting capture"),
++                Err(error) => warn!(index = device_index, %error, "control reporting check failed; restarting capture"),
++            }
++        }
++    }
++    // The manager re-arms only after this session has restored its controls.
+     if raw_input {
+         let _ = sink.send(CapturedInput::Interrupted);
+     }
+@@ -313,6 +332,31 @@
+ }
+ 
+ impl ArmedControls {
++    /// Check that the firmware still reports the controls this session owns.
++    async fn reporting_matches(&self) -> Result<bool, v20::Hidpp20Error> {
++        let Some((rc, _)) = self.reprog.as_ref() else {
++            return Ok(true);
++        };
++        let controls = std::iter::once((reprog_controls::GESTURE_BUTTON_CID, true))
++            .filter(|_| self.gesture_diverted)
++            .chain(self.dpi_cids.iter().map(|&cid| (cid, false)))
++            .chain(self.button_cids.iter().map(|&(cid, _)| (cid, false)));
++        for (cid, raw_xy) in controls {
++            let reporting = rc.get_cid_reporting(cid).await?;
++            if !reporting.diverted || reporting.raw_xy != raw_xy {
++                warn!(
++                    cid,
++                    diverted = reporting.diverted,
++                    raw_xy = reporting.raw_xy,
++                    expected_raw_xy = raw_xy,
++                    "device control reporting differs from capture plan"
++                );
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
+     /// Restore every diverted control. Failures are logged, not propagated.
+     async fn disarm(&self) {
+         if let Some((rc, _)) = self.reprog.as_ref() {

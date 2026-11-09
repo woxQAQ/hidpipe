@@ -15,6 +15,7 @@ openlogi.overrideAttrs (
       ./openlogi-pointer-capture.patch
       ./openlogi-bridge.patch
       ./openlogi-switch-recovery.patch
+      ./openlogi-reporting-recovery.patch
       ./openlogi-managed-restart.patch
     ];
     postPatch =
