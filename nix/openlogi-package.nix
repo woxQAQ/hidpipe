@@ -16,6 +16,7 @@ openlogi.overrideAttrs (
       ./openlogi-bridge.patch
       ./openlogi-switch-recovery.patch
       ./openlogi-reporting-recovery.patch
+      ./openlogi-repeat-gestures.patch
       ./openlogi-managed-restart.patch
     ];
     postPatch =
@@ -27,6 +28,7 @@ openlogi.overrideAttrs (
       + lib.optionalString stdenv.hostPlatform.isLinux ''
         install -Dm644 ${./tests/openlogi-capture.rs} crates/openlogi-hook/examples/hidpipe-capture.rs
         install -Dm644 ${./tests/openlogi-switch-recovery.rs} crates/openlogi-agent-core/tests/switch_recovery.rs
+        install -Dm644 ${./tests/openlogi-repeat-gestures.rs} crates/openlogi-agent-core/tests/repeat_gestures.rs
       '';
     passthru = (old.passthru or { }) // {
       inherit withGui;
