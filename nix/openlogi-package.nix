@@ -3,7 +3,17 @@
   stdenv,
   openlogi,
   withGui ? true,
+  gestureRepeatThreshold ? 150,
+  gestureRepeatIntervalMs ? 300,
 }:
+assert lib.assertMsg (
+  lib.isInt gestureRepeatThreshold && gestureRepeatThreshold >= 1 && gestureRepeatThreshold <= 32767
+) "gestureRepeatThreshold must be an integer between 1 and 32767 raw-XY units.";
+assert lib.assertMsg (
+  lib.isInt gestureRepeatIntervalMs
+  && gestureRepeatIntervalMs >= 1
+  && gestureRepeatIntervalMs <= 60000
+) "gestureRepeatIntervalMs must be an integer between 1 and 60000 milliseconds.";
 assert lib.assertMsg (
   openlogi.version == "0.6.25"
 ) "The hidpipe bridge patches target OpenLogi 0.6.25.";
@@ -24,6 +34,11 @@ openlogi.overrideAttrs (
       + ''
         # Both processes compile the same fixed-size pointer protocol.
         install -Dm644 ${../proto/src/pointer.rs} crates/openlogi-agent-core/src/remote/wire.rs
+        substituteInPlace crates/openlogi-core/src/binding/swipe.rs \
+          --replace-fail 'pub const REPEAT_THRESHOLD: i32 = 150;' \
+                         'pub const REPEAT_THRESHOLD: i32 = ${toString gestureRepeatThreshold};' \
+          --replace-fail 'pub const REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);' \
+                         'pub const REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(${toString gestureRepeatIntervalMs});'
       ''
       + lib.optionalString stdenv.hostPlatform.isLinux ''
         install -Dm644 ${./tests/openlogi-capture.rs} crates/openlogi-hook/examples/hidpipe-capture.rs
@@ -31,7 +46,7 @@ openlogi.overrideAttrs (
         install -Dm644 ${./tests/openlogi-repeat-gestures.rs} crates/openlogi-agent-core/tests/repeat_gestures.rs
       '';
     passthru = (old.passthru or { }) // {
-      inherit withGui;
+      inherit withGui gestureRepeatThreshold gestureRepeatIntervalMs;
     };
   }
   // lib.optionalAttrs (!withGui) {

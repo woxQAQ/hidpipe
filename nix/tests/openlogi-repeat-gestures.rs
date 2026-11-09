@@ -9,7 +9,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use openlogi_agent_core::{orchestrator::Orchestrator, remote};
-use openlogi_core::binding::{Action, ButtonId, GESTURE_HOLD_FOR_SWIPE, GestureDirection};
+use openlogi_core::binding::{
+    Action, ButtonId, GESTURE_HOLD_FOR_SWIPE, GestureDirection, SwipeAccumulator,
+};
 use openlogi_core::config::Config;
 use openlogi_hid::gesture::CapturedInput;
 use remote::wire::{MAGIC, PointerEvent};
@@ -34,7 +36,8 @@ fn wait_actions(path: &Path, expected: &str) {
 }
 
 fn swipe(send: &mut impl FnMut(PointerEvent), dx: i32, dy: i32) {
-    std::thread::sleep(GESTURE_HOLD_FOR_SWIPE + Duration::from_millis(20));
+    let interval = GESTURE_HOLD_FOR_SWIPE.max(SwipeAccumulator::REPEAT_INTERVAL);
+    std::thread::sleep(interval + Duration::from_millis(20));
     send(PointerEvent::GestureMotion { dx, dy });
 }
 
@@ -44,16 +47,20 @@ fn exercise(mut send: impl FnMut(PointerEvent), actions: &Path, expected: &mut S
     expected.push('R');
     wait_actions(actions, expected);
 
-    // A single hold supports repeated directions and then a reversal.
-    swipe(&mut send, 60, 0);
+    // Repeats require a fresh displacement up to the configured threshold.
+    let threshold = SwipeAccumulator::REPEAT_THRESHOLD;
+    swipe(&mut send, threshold - 1, 0);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(std::fs::read_to_string(actions).unwrap(), *expected);
+    send(PointerEvent::GestureMotion { dx: 1, dy: 0 });
     expected.push('R');
     wait_actions(actions, expected);
-    swipe(&mut send, -60, 0);
+    swipe(&mut send, -threshold, 0);
     expected.push('L');
     wait_actions(actions, expected);
 
     // Both axes must start from zero after a commit.
-    swipe(&mut send, 0, -60);
+    swipe(&mut send, 0, -threshold);
     expected.push('U');
     wait_actions(actions, expected);
     send(button(false));

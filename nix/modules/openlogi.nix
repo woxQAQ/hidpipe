@@ -17,6 +17,28 @@
         a GUI automatically.
       '';
     };
+    gestures = {
+      repeatThreshold = lib.mkOption {
+        type = lib.types.ints.between 1 32767;
+        default = 150;
+        description = ''
+          Minimum raw-XY displacement for each subsequent gesture while holding
+          the button. Higher values require more travel and reduce sensitivity.
+          The first gesture retains OpenLogi's 50-unit threshold.
+          Changing this option rebuilds the default OpenLogi package.
+        '';
+      };
+      repeatIntervalMs = lib.mkOption {
+        type = lib.types.ints.between 1 60000;
+        default = 300;
+        description = ''
+          Minimum milliseconds between directional gesture actions in one hold.
+          Higher values slow repetition. The first gesture retains OpenLogi's
+          160 ms hold gate. Changing this option rebuilds the default OpenLogi
+          package. A custom openlogi.package must provide its own gesture settings.
+        '';
+      };
+    };
     basePackage = lib.mkOption {
       type = lib.types.package;
       default = pkgs.openlogi;
@@ -27,6 +49,8 @@
       default = pkgs.callPackage ../openlogi-package.nix {
         openlogi = cfg.openlogi.basePackage;
         withGui = cfg.openlogi.gui.enable;
+        gestureRepeatThreshold = cfg.openlogi.gestures.repeatThreshold;
+        gestureRepeatIntervalMs = cfg.openlogi.gestures.repeatIntervalMs;
       };
       description = "OpenLogi with the hidpipe bridge patches. GUI inclusion follows openlogi.gui.enable.";
     };

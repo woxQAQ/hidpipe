@@ -1,18 +1,38 @@
 --- a/crates/openlogi-core/src/binding/swipe.rs
 +++ b/crates/openlogi-core/src/binding/swipe.rs
-@@ -71,8 +71,9 @@
+@@ -33,6 +33,10 @@
+ /// down), so an upward swipe (negative `dy`) maps to [`GestureDirection::Up`].
+ #[must_use]
+ pub fn detect_swipe(dx: i32, dy: i32) -> Option<GestureDirection> {
++    detect_swipe_with_threshold(dx, dy, GESTURE_SWIPE_THRESHOLD)
++}
++
++fn detect_swipe_with_threshold(dx: i32, dy: i32, threshold: i32) -> Option<GestureDirection> {
+     // Saturating throughout: a [`SwipeAccumulator`] hold that never commits (a
+     // sustained diagonal) keeps summing travel, so `dx`/`dy` can reach the i32
+     // bounds. `i32::MIN.abs()` would panic and a plain `dominant * 35` would
+@@ -40,7 +44,7 @@
+     // hazard we must never hit. The clamp is inert in the normal range.
+     let (abs_x, abs_y) = (dx.saturating_abs(), dy.saturating_abs());
+     let dominant = abs_x.max(abs_y);
+-    if dominant < GESTURE_SWIPE_THRESHOLD {
++    if dominant < threshold {
+         return None;
+     }
+     let cross_limit = GESTURE_SWIPE_DEADZONE.max(dominant.saturating_mul(35) / 100);
+@@ -71,8 +75,9 @@
  /// button's hold accumulates travel; the instant the dominant axis commits a
  /// direction — after the button has been held [`GESTURE_HOLD_FOR_SWIPE`], so a
  /// quick click whose cursor drifted doesn't count — [`Self::accumulate`] returns
 -/// that direction exactly once, like Logitech Options+. A hold that never
 -/// commits is a plain click, reported by [`Self::end`].
-+/// that direction and starts a fresh travel segment. Segments share the same
-+/// minimum duration, limiting repeated actions during a long swipe. A hold that
-+/// never commits is a plain click, reported by [`Self::end`].
++/// that direction and starts a fresh travel segment. Subsequent segments use
++/// [`SwipeAccumulator::REPEAT_THRESHOLD`] and [`SwipeAccumulator::REPEAT_INTERVAL`].
++/// A hold that never commits is a plain click, reported by [`Self::end`].
  ///
  /// The two paths differ only in *what identifies the held control* (a
  /// [`ButtonId`](super::ButtonId) for the OS hook, a diverted CID for the HID++ gesture control), so each owns
-@@ -81,15 +82,15 @@
+@@ -81,19 +86,24 @@
  /// (one resolved a swipe only on release), which mis-fired the click.
  #[derive(Debug, Default)]
  pub struct SwipeAccumulator {
@@ -34,25 +54,45 @@
      fired: bool,
  }
  
-@@ -110,11 +111,11 @@
+ impl SwipeAccumulator {
++    /// Minimum raw-XY travel for subsequent swipes in a hold, set by the package.
++    pub const REPEAT_THRESHOLD: i32 = 150;
++    /// Minimum interval between swipe commits, set by the package.
++    pub const REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
++
+     /// Begin a fresh hold, resetting the travel accumulator and commit state.
+     pub fn begin(&mut self) {
+         self.held_since = Some(Instant::now());
+@@ -110,20 +120,28 @@
      }
  
      /// Feed a pointer-move / raw-XY delta into the current hold. Returns
 -    /// `Some(direction)` exactly once per hold — the instant travel commits, and
 -    /// only after the hold passes [`GESTURE_HOLD_FOR_SWIPE`] — and `None` while
 -    /// still too short, already committed, or not holding.
-+    /// `Some(direction)` when a travel segment commits, only after the segment
-+    /// passes [`GESTURE_HOLD_FOR_SWIPE`]. Each commit clears travel and restarts
-+    /// the duration gate, allowing repeated swipes until release.
++    /// `Some(direction)` when a travel segment passes its travel and duration
++    /// gates. Each commit clears travel and restarts the duration gate, allowing
++    /// repeated swipes until release.
      pub fn accumulate(&mut self, dx: i32, dy: i32) -> Option<GestureDirection> {
 -        if self.fired || self.held_since.is_none() {
 +        if self.held_since.is_none() {
              return None;
          }
          self.dx = self.dx.saturating_add(dx);
-@@ -124,6 +125,9 @@
-             .is_some_and(|t| t.elapsed() >= GESTURE_HOLD_FOR_SWIPE);
-         if held_long_enough && let Some(dir) = detect_swipe(self.dx, self.dy) {
+         self.dy = self.dy.saturating_add(dy);
+-        let held_long_enough = self
+-            .held_since
+-            .is_some_and(|t| t.elapsed() >= GESTURE_HOLD_FOR_SWIPE);
+-        if held_long_enough && let Some(dir) = detect_swipe(self.dx, self.dy) {
++        let (threshold, interval) = if self.fired {
++            (Self::REPEAT_THRESHOLD, Self::REPEAT_INTERVAL)
++        } else {
++            (GESTURE_SWIPE_THRESHOLD, GESTURE_HOLD_FOR_SWIPE)
++        };
++        let held_long_enough = self.held_since.is_some_and(|t| t.elapsed() >= interval);
++        if held_long_enough
++            && let Some(dir) = detect_swipe_with_threshold(self.dx, self.dy, threshold)
++        {
              self.fired = true;
 +            self.dx = 0;
 +            self.dy = 0;
@@ -60,7 +100,7 @@
              return Some(dir);
          }
          None
-@@ -213,16 +217,16 @@
+@@ -213,16 +231,16 @@
      // ── SwipeAccumulator (the shared mid-swipe state machine) ─────────────────
  
      #[test]

@@ -257,6 +257,8 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 | `openlogi.device` | `null` | Linux, macOS | OpenLogi config key (`null` selects the first online device on Linux or saved selection on macOS) |
 | `openlogi.socket` | `"~/.cache/openlogi-hidpipe/pointer.sock"` | Linux, macOS | Private local socket shared by `hidpipe` and `openlogi-agent` |
 | `openlogi.gui.enable` | `true` | Linux, macOS | Build and install the OpenLogi GUI alongside the CLI and agent |
+| `openlogi.gestures.repeatThreshold` | `150` | Linux, macOS | Raw-XY displacement required for each repeated gesture (`1`–`32767`; larger is less sensitive) |
+| `openlogi.gestures.repeatIntervalMs` | `300` | Linux, macOS | Minimum interval between gesture actions in milliseconds (`1`–`60000`) |
 | `openlogi.basePackage` | `pkgs.openlogi` | Linux, macOS | Unmodified OpenLogi `0.6.25` package to which bridge patches are applied |
 | `openlogi.package` | patched OpenLogi | Linux, macOS | Patched OpenLogi package built with `openlogi.gui.enable` |
 
@@ -277,6 +279,10 @@ services.hidpipe = {
     enable = true;
     mouse = "MX Master 2S";
     gui.enable = true; # default; retain the OpenLogi settings UI
+    gestures = {
+      repeatThreshold = 150; # raw-XY units; increase to require more travel
+      repeatIntervalMs = 300; # increase to slow repeated actions
+    };
     # device = "<OpenLogi config key>"; # required when multiple mice are configured
   };
 };
@@ -309,7 +315,7 @@ services.hidpipe = {
 
 - **Ordinary Wheel input:** The wire carries wheel deltas in 1/120-notch units on both backends. On the evdev path the server reads `REL_WHEEL_HI_RES`/`REL_HWHEEL_HI_RES` when the device offers them (ignoring the legacy ±1-per-notch axis so a notch is not counted twice) and scales plain `REL_WHEEL` up by 120 otherwise. On macOS, ordinary evdev Wheel and OpenLogi `PointerEvent::Wheel` input is injected as precise PIXEL scrolling, mapping one notch to ten Quartz points before scale/invert. Each connection accumulates signed subpixel remainder independently per axis, truncating toward zero; for example, four raw deltas of 30 emit 2, 3, 2, 3 points at default scale. No event is emitted until an axis has a whole point. ReleaseAll, pointer reset, disconnect and reconnect discard remainder. Finite scaling that exceeds the injectable i32 range saturates and discards excess, without retaining a compensation queue. Ten points is a destination mapping baseline, not a guarantee of identical screen movement in every application. `--invert-scroll-x/-y` and `--scroll-scale-x/-y` (Home Manager: `scroll.invertX/invertY` and `scroll.scaleX/scaleY`) adjust this Wheel input at the Mac injection point.
 - **HID++ thumbwheel:** OpenLogi resolves thumbwheel actions through the destination profile and injects its `Effect::Scroll` directly. The CLI and Home Manager Wheel modifiers above do not affect this path; tune sensitivity and bindings in the Mac OpenLogi profile.
-- **Repeated gestures:** Hold the gesture button to keep triggering directional actions without releasing it. Each trigger starts a fresh displacement segment with the existing 50-unit travel threshold and a minimum 160 ms between triggers. Continuing in the same direction repeats the action; changing direction starts from the last trigger's position. Releasing after any swipe does not execute the Click binding. These rules apply to local and destination-side OpenLogi gesture resolution.
+- **Repeated gestures:** Hold the gesture button to keep triggering directional actions without releasing it. The first swipe uses OpenLogi's 50-unit raw-XY threshold and 160 ms hold gate. Each subsequent swipe starts a fresh displacement segment and requires both `openlogi.gestures.repeatThreshold` travel (default `150`) and `openlogi.gestures.repeatIntervalMs` elapsed time (default `300` ms). Increase either value to reduce sensitivity. Continuing in the same direction repeats the action; changing direction starts from the last trigger's position. Releasing after any swipe does not execute the Click binding. These rules apply to local and destination-side OpenLogi gesture resolution. The settings are compiled into each machine's default OpenLogi package; changing them requires rebuilding and activating that machine's configuration. A custom `openlogi.package` must supply its own settings.
 - **HID++ reporting recovery:** Capture sessions read back diverted control settings every five seconds. If the mouse loses temporary gesture/button reporting while the session is still running, OpenLogi cancels pending gestures, drains the old session, and re-arms capture through its existing session manager. This covers reporting loss that leaves the device route unchanged. Recovery waits for the mouse to respond; it is independent of the remote pointer lease. The hardware regression script `nix/tests/openlogi-reporting-recovery.py` temporarily clears gesture reporting and verifies that a running patched agent restores it.
 - **Lease safety and button quarantine:** Remote pointer capture uses a connection-scoped lease with a 750 ms heartbeat deadline. A held mouse button prevents remote entry. Disconnect, a stalled server, an input-hook failure, or a full capture queue revokes the lease and restores Linux routing immediately. Buttons still held at revocation are quarantined until physical release (sharing one atomic state with physical holds so concurrent releases are never lost), and pending gestures are cancelled before local routing resumes.
 - **Hardware settings:** DPI, SmartShift, and other device-level settings belong to the Linux profile; the bridge does not forward hardware configuration changes from macOS back to the physical mouse.
