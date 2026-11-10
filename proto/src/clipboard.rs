@@ -5,7 +5,8 @@
 
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::TcpListener;
+use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
