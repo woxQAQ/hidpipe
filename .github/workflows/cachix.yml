@@ -1,0 +1,21 @@
+name: Trigger binary cache
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  trigger-cache:
+    if: github.repository == 'woxQAQ/hidpipe'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build this revision with the host configuration
+        env:
+          GH_TOKEN: ${{ secrets.NIXOS_CONFIG_DISPATCH_TOKEN }}
+        run: |
+          gh workflow run cicd_cache.yaml \
+            --repo woxQAQ/nixos-config \
+            --ref main \
+            --field source=hidpipe \
+            --field revision="$GITHUB_SHA"
