@@ -25,6 +25,8 @@
 
 #![deny(unsafe_code)]
 
+#[allow(unsafe_code)]
+mod clipboard;
 mod diagnostics;
 #[allow(unsafe_code)]
 mod display_cache;
@@ -84,7 +86,11 @@ fn timestamp() -> String {
 fn main() {
     let args = Args::parse();
     if args.clipboard {
-        proto::clipboard::spawn_client(args.host.clone(), args.clipboard_port);
+        proto::clipboard::spawn_client(
+            args.host.clone(),
+            args.clipboard_port,
+            clipboard::MacClipboard,
+        );
     }
     let display = DisplayCache::main_display().unwrap_or_else(|error| {
         log!("failed to initialize display geometry: {error}");
@@ -586,7 +592,7 @@ Usage: hidpipe-client <server-address> [options]
 Options:
   --port <port>   server port (default 24800)
   --openlogi-socket <path>  resolve mouse input with the local OpenLogi agent
-  --clipboard    share text clipboard over a separate trusted-LAN connection
+  --clipboard    share text and images over a separate trusted-LAN connection
   --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
   --input-feedback  reply to every input frame to mitigate TCP delayed ACK
   --latency-stats   log local timing summaries every 5 seconds

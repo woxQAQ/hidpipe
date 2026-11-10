@@ -26,12 +26,13 @@ use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use evdev::{Device, InputEventKind, Key, RelativeAxisType};
-use hidpipe_proto::{bridge::Capture, ButtonState, Frame, KeyState, MouseButton};
+use evdev::{Device, InputEvent, InputEventKind, Key, RelativeAxisType};
+use hidpipe_proto::{bridge::Capture, clipboard, ButtonState, Frame, KeyState, MouseButton};
 
 use args::Args;
 use barrier::BarrierEvent;
 use net::{Connection, NetMsg};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -97,7 +98,7 @@ fn main() -> io::Result<()> {
     listener.set_nonblocking(true)?;
     log!("listening on {}:{}", args.bind, args.port);
     if args.clipboard {
-        hidpipe_proto::clipboard::spawn_server(&args.bind, args.clipboard_port)?;
+        clipboard::spawn_server(&args.bind, args.clipboard_port)?;
         log!(
             "clipboard listening on {}:{}",
             args.bind,
@@ -531,13 +532,12 @@ fn is_mouse(dev: &Device) -> bool {
 
 /// fetch_events borrows the device for its iterator; collecting into a Vec
 /// lets the caller hold the events while mutating self.
-fn fetch_all(dev: &mut Device) -> io::Result<Vec<evdev::InputEvent>> {
+fn fetch_all(dev: &mut Device) -> io::Result<Vec<InputEvent>> {
     Ok(dev.fetch_events()?.collect())
 }
 
 /// evdev 0.12 does not expose nonblocking mode, so fcntl the fd directly.
 fn set_nonblocking(dev: &Device) -> io::Result<()> {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
     fcntl(dev.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
     Ok(())
 }

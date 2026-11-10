@@ -4,8 +4,8 @@ use std::io;
 use std::net::TcpStream;
 use std::time::Instant;
 
-use hidpipe_proto as proto;
-use proto::{bridge::Resolver, Frame, PointerEvent};
+use hidpipe_proto::{self as proto};
+use proto::{bridge::Resolver, latency::LatencyStats, Frame, PointerEvent};
 
 pub fn run(
     stream: &mut TcpStream,
@@ -16,7 +16,7 @@ pub fn run(
     allowed: impl Fn() -> bool,
 ) -> io::Result<()> {
     let mut stats = latency_stats.then(|| {
-        proto::latency::LatencyStats::new([
+        LatencyStats::new([
             "client.resolve",
             "client.inject",
             "client.feedback",
@@ -86,11 +86,7 @@ pub fn run(
 }
 
 /// Keep the disabled diagnostics path free of clock reads and allocations.
-fn timed<T>(
-    stats: &mut Option<proto::latency::LatencyStats<4>>,
-    stage: usize,
-    action: impl FnOnce() -> T,
-) -> T {
+fn timed<T>(stats: &mut Option<LatencyStats<4>>, stage: usize, action: impl FnOnce() -> T) -> T {
     let started = stats.as_ref().map(|_| Instant::now());
     let result = action();
     if let (Some(stats), Some(started)) = (stats.as_mut(), started) {

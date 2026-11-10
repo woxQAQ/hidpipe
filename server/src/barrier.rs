@@ -10,18 +10,31 @@
 use std::error::Error;
 use std::fs::File;
 use std::io;
+use std::io::ErrorKind::NotFound;
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface,
-};
+use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_output::WlOutput;
+use wayland_client::protocol::wl_pointer::WlPointer;
+use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_shm::{Format, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
+use wayland_client::protocol::wl_surface::WlSurface;
+use wayland_client::protocol::{wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
-use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{
+    Layer, ZwlrLayerShellV1,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
+    Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1,
+};
 
 // The output space may be ceiled while layer-shell geometry is rounded.
 // Extend outward by one logical pixel so the clamped pointer still hits the
@@ -41,7 +54,7 @@ pub enum BarrierEvent {
 pub fn spawn(tx: Sender<BarrierEvent>) -> io::Result<()> {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return Err(io::Error::new(
-            io::ErrorKind::NotFound,
+            NotFound,
             "WAYLAND_DISPLAY is not set; edge switching requires a Wayland session",
         ));
     }
@@ -80,21 +93,21 @@ fn run(tx: Sender<BarrierEvent>) -> Result<(), Box<dyn Error>> {
 
 struct State {
     tx: Sender<BarrierEvent>,
-    compositor: Option<wl_compositor::WlCompositor>,
-    shm: Option<wl_shm::WlShm>,
-    layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    seat: Option<wl_seat::WlSeat>,
-    pointer: Option<wl_pointer::WlPointer>,
-    outputs: Vec<wl_output::WlOutput>,
+    compositor: Option<WlCompositor>,
+    shm: Option<WlShm>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    seat: Option<WlSeat>,
+    pointer: Option<WlPointer>,
+    outputs: Vec<WlOutput>,
     barriers: Vec<Barrier>,
 }
 
 struct Barrier {
-    surface: wl_surface::WlSurface,
-    layer: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    surface: WlSurface,
+    layer: ZwlrLayerSurfaceV1,
     /// An all-zero pixel is fully transparent; the file handle must live
     /// as long as the buffer.
-    backing: Option<(File, wl_buffer::WlBuffer)>,
+    backing: Option<(File, WlBuffer)>,
     height: u32,
 }
 
@@ -121,19 +134,18 @@ impl State {
             let layer = layer_shell.get_layer_surface(
                 &surface,
                 Some(output),
-                zwlr_layer_shell_v1::Layer::Top,
+                Layer::Top,
                 "hidpipe-barrier".to_string(),
                 qh,
                 (),
             );
-            use zwlr_layer_surface_v1::Anchor;
             // Keep one pixel inside the output and cover rounding at its edge.
             // Ignore reserved zones so the barrier follows the output boundary.
             layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Right);
             layer.set_size(BARRIER_WIDTH as u32, 0);
             layer.set_margin(0, -EDGE_PADDING, 0, 0);
             layer.set_exclusive_zone(-1);
-            layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             surface.commit();
             self.barriers.push(Barrier {
                 surface,
@@ -144,7 +156,7 @@ impl State {
         }
     }
 
-    fn is_barrier(&self, surface: &wl_surface::WlSurface) -> bool {
+    fn is_barrier(&self, surface: &WlSurface) -> bool {
         self.barriers.iter().any(|b| b.surface == *surface)
     }
 }
@@ -153,10 +165,10 @@ impl State {
 /// pointer events; attach an all-zero (fully transparent) shm buffer to
 /// give it geometry.
 fn make_transparent_buffer(
-    shm: &wl_shm::WlShm,
+    shm: &WlShm,
     height: u32,
     qh: &QueueHandle<State>,
-) -> Result<(File, wl_buffer::WlBuffer), Box<dyn Error>> {
+) -> Result<(File, WlBuffer), Box<dyn Error>> {
     let height = height.max(1);
     let stride = BARRIER_WIDTH * 4; // ARGB8888
     let size = u64::from(height) * stride as u64;
@@ -168,7 +180,7 @@ fn make_transparent_buffer(
         BARRIER_WIDTH,
         height as i32,
         stride,
-        wl_shm::Format::Argb8888,
+        Format::Argb8888,
         qh,
         (),
     );
@@ -194,10 +206,10 @@ fn unlinked_tempfile() -> std::io::Result<File> {
     Ok(file)
 }
 
-impl Dispatch<wl_registry::WlRegistry, ()> for State {
+impl Dispatch<WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
-        registry: &wl_registry::WlRegistry,
+        registry: &WlRegistry,
         event: wl_registry::Event,
         _: &(),
         _: &Connection,
@@ -235,10 +247,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
     }
 }
 
-impl Dispatch<wl_seat::WlSeat, ()> for State {
+impl Dispatch<WlSeat, ()> for State {
     fn event(
         state: &mut Self,
-        seat: &wl_seat::WlSeat,
+        seat: &WlSeat,
         event: wl_seat::Event,
         _: &(),
         _: &Connection,
@@ -255,10 +267,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
     }
 }
 
-impl Dispatch<wl_pointer::WlPointer, ()> for State {
+impl Dispatch<WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        _: &wl_pointer::WlPointer,
+        _: &WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -276,10 +288,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     }
 }
 
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
     fn event(
         state: &mut Self,
-        layer: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        layer: &ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
         _: &(),
         _: &Connection,
@@ -331,11 +343,11 @@ macro_rules! empty_dispatch {
 }
 
 empty_dispatch!(
-    wl_compositor::WlCompositor,
-    wl_output::WlOutput,
-    wl_shm::WlShm,
-    wl_shm_pool::WlShmPool,
-    wl_buffer::WlBuffer,
-    wl_surface::WlSurface,
-    zwlr_layer_shell_v1::ZwlrLayerShellV1
+    WlCompositor,
+    WlOutput,
+    WlShm,
+    WlShmPool,
+    WlBuffer,
+    WlSurface,
+    ZwlrLayerShellV1
 );

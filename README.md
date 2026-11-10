@@ -95,7 +95,7 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `--keyboard <substr>` | auto-detect | Keyboard device name substring filter (prefers `keyd` virtual keyboard) |
 | `--mouse <substr>` | auto-detect | Mouse device name substring filter (mutually exclusive with `--openlogi-socket`) |
 | `--openlogi-socket <path>` | disabled | Capture the mouse through an OpenLogi bridge socket |
-| `--clipboard` | off | Enable bidirectional text clipboard sharing on a separate TCP connection |
+| `--clipboard` | off | Enable bidirectional text and image clipboard sharing on a separate TCP connection |
 | `--clipboard-port <port>` | `24801` | Clipboard listen port (requires `--clipboard`; must differ from the input port) |
 | `--swap-caps-esc` | off | Swap Caps Lock and Escape on capture (use only when `keyd` or `udev` does not already do so) |
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds |
@@ -106,7 +106,7 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `--port <port>` | `24800` | Server TCP port |
 | `--openlogi-socket <path>` | disabled | Resolve mouse input with the local OpenLogi agent |
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds and `[slow-inject]` records (`>= 2 ms`) |
-| `--clipboard` | off | Enable bidirectional text clipboard sharing with the Linux server |
+| `--clipboard` | off | Enable bidirectional text and image clipboard sharing with the Linux server |
 | `--clipboard-port <port>` | `24801` | Server clipboard port (requires `--clipboard`; must match the server) |
 | `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
 | `--scroll-scale-x <f>` | `1.0` | Multiply horizontal Wheel input by a finite, non-negative value; `0` disables this axis |
@@ -125,11 +125,11 @@ services.hidpipe.clipboard = {
 };
 ```
 
-Copying text on either machine updates the other machine's clipboard, including while input remains local. The clipboard is checked every 250 ms; command execution and network transfer add to this interval. Unicode, empty text, and trailing newlines are preserved. Images, files, rich text formatting, and the Wayland primary selection are not transferred. Text is limited to 1 MiB of UTF-8 bytes. Oversized local text is skipped; oversized or malformed incoming records close the clipboard connection.
+Copying text or an image on either machine updates the other machine's clipboard, including while input remains local. The clipboard is checked every 250 ms; backend access and network transfer add to this interval. Unicode, empty text, and trailing newlines are preserved. Images use PNG (up to 16 MiB); macOS also converts TIFF clipboard images, such as screenshots, to PNG. When both image and text representations exist, the image takes priority. Linux applications must offer `image/png`. Files, rich text formatting, and the Wayland primary selection are not transferred. Text is limited to 1 MiB of UTF-8 bytes. Oversized local content is skipped; oversized or malformed incoming records close the clipboard connection.
 
-Clipboard transfer uses a separate TCP connection so large text does not queue behind keyboard and mouse frames. Both peers record their existing clipboard on connection and synchronize subsequent changes; connecting or reconnecting does not push old clipboard contents. Received text is not echoed back. The client retries disconnected clipboard sessions every two seconds, independently of the input connection. This channel is plaintext and unauthenticated, like the input channel: enable it only on a trusted LAN. Anyone who can reach the enabled clipboard port can read subsequent copied text and replace clipboard contents.
+Clipboard transfer uses a separate TCP connection so images and large text do not queue behind keyboard and mouse frames. Both peers record their existing clipboard on connection and synchronize subsequent changes; connecting or reconnecting does not push old clipboard contents. Received content is not echoed back. The client retries disconnected clipboard sessions every two seconds, independently of the input connection. The clipboard protocol is version 2; update both peers together because text-only version 1 peers are rejected. This channel is plaintext and unauthenticated, like the input channel: enable it only on a trusted LAN. Anyone who can reach the enabled clipboard port can read subsequent copied content and replace clipboard contents.
 
-The Linux backend requires a Wayland session and `wl-copy` / `wl-paste` from `wl-clipboard`; the Nix package includes these commands automatically. macOS uses `/usr/bin/pbcopy` and `/usr/bin/pbpaste`. With `openFirewall = true`, the NixOS module also opens the configured clipboard port when sharing is enabled. Home Manager users must open that TCP port at the system level themselves.
+The Linux backend requires a Wayland session and `wl-copy` / `wl-paste` from `wl-clipboard`; the Nix package includes these commands automatically. macOS uses the native AppKit Pasteboard API. With `openFirewall = true`, the NixOS module also opens the configured clipboard port when sharing is enabled. Home Manager users must open that TCP port at the system level themselves.
 
 ## NixOS and Home Manager
 
@@ -235,7 +235,7 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 | `enable` | `false` | Linux, macOS | Enable the `hidpipe` service |
 | `package` | native `hidpipe` package | Linux, macOS | Package providing `hidpipe-server` or `hidpipe-client` |
 | `port` | `24800` | Linux, macOS | TCP port used by server and client |
-| `clipboard.enable` | `false` | Linux, macOS | Enable bidirectional text clipboard sharing on the trusted LAN |
+| `clipboard.enable` | `false` | Linux, macOS | Enable bidirectional text and image clipboard sharing on the trusted LAN |
 | `clipboard.port` | `24801` | Linux, macOS | Separate clipboard TCP port; use the same value on both peers |
 | `latencyStats` | `false` | Linux, macOS | Log local latency counts, means, and maxima every 5 seconds |
 | `user` | required | NixOS | Desktop user who runs the server and receives `input` (and `uinput`) group membership |
@@ -389,4 +389,4 @@ The old `--expected-fixed` plus `--expected-count` mode remains available for hi
 - [ ] Multi-monitor support: per-output barrier configuration on Linux, cursor clamping across displays on macOS
 - [ ] Map the Mac cursor's initial Y coordinate by screen height ratio when entering remote mode
 - [ ] Media keys (HID Consumer Page)
-- [ ] Clipboard sync (needs careful design, may stay out)
+- [x] Bidirectional text and PNG clipboard sync

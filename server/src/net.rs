@@ -5,13 +5,14 @@
 //! `NetMsg::Dead(connection generation)`. The main loop uses the generation
 //! to ignore late death notices from superseded connections.
 
-use std::io;
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{io, net};
 
 use hidpipe_proto as proto;
+use hidpipe_proto::latency::LatencyStats;
 use proto::Frame;
 
 const PING_INTERVAL: Duration = Duration::from_secs(2);
@@ -81,7 +82,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+        let _ = self.shutdown.shutdown(net::Shutdown::Both);
     }
 }
 
@@ -92,8 +93,7 @@ fn writer_loop(
     id: u64,
     latency_stats: bool,
 ) {
-    let mut stats =
-        latency_stats.then(|| proto::latency::LatencyStats::new(["server.queue", "server.write"]));
+    let mut stats = latency_stats.then(|| LatencyStats::new(["server.queue", "server.write"]));
     // Pings must go out on schedule, independent of data traffic. If we
     // only pinged after 2s of channel idle, constant mouse motion would
     // starve Ping forever: the peer would never see a Ping, never answer

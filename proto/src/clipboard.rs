@@ -1,60 +1,113 @@
-//! Optional text clipboard channel, independent of the latency-sensitive HID stream.
+//! Optional text and image clipboard channel, independent of the HID stream.
 //!
 //! Both peers baseline their local clipboard on connection. Only subsequent
 //! changes are shared, so reconnecting does not overwrite an existing clipboard.
 
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{net, thread};
 
-const MAGIC: &[u8; 8] = b"HIDCLIP\x01";
+const MAGIC: &[u8; 8] = b"HIDCLIP\x02";
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// PNG is the shared image representation on Wayland and macOS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Content {
+    Text(String),
+    Png(Vec<u8>),
+}
+
+impl Content {
+    fn payload(&self) -> &[u8] {
+        match self {
+            Self::Text(text) => text.as_bytes(),
+            Self::Png(bytes) => bytes,
+        }
+    }
+
+    fn kind(&self) -> u8 {
+        match self {
+            Self::Text(_) => 0,
+            Self::Png(_) => 1,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        match self {
+            Self::Text(_) => MAX_TEXT_BYTES,
+            Self::Png(_) => MAX_IMAGE_BYTES,
+        }
+    }
+}
+
 const POLL: Duration = Duration::from_millis(250);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT: Duration = Duration::from_secs(2);
 const DEAD_TIMEOUT: Duration = Duration::from_secs(8);
 const PING: u32 = u32::MAX;
 
-/// A missing text representation is distinct from an explicitly empty string.
+/// A missing supported representation differs from an explicitly empty string.
 pub trait Clipboard {
-    fn read(&mut self) -> io::Result<Option<String>>;
-    fn write(&mut self, text: &str) -> io::Result<()>;
+    fn read(&mut self) -> io::Result<Option<Content>>;
+    fn write(&mut self, content: &Content) -> io::Result<()>;
 }
 
 pub struct SystemClipboard;
 
+#[cfg(target_os = "linux")]
 impl Clipboard for SystemClipboard {
-    fn read(&mut self) -> io::Result<Option<String>> {
-        #[cfg(target_os = "linux")]
-        let mut command = {
-            let mut command = Command::new("wl-paste");
-            command.args(["--no-newline", "--type", "text"]);
-            command
-        };
-        #[cfg(target_os = "macos")]
-        let mut command = Command::new("/usr/bin/pbpaste");
-        let (success, output) = execute(&mut command, None)?;
+    fn read(&mut self) -> io::Result<Option<Content>> {
+        let (success, types) = execute(Command::new("wl-paste").arg("--list-types"), None)?;
         if !success {
             return Ok(None);
         }
-        let text = String::from_utf8(output)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "clipboard is not UTF-8"))?;
-        Ok(Some(text))
+        let image = types
+            .split(|byte| *byte == b'\n')
+            .any(|mime| mime == b"image/png");
+        let (success, output) = execute(
+            Command::new("wl-paste").args([
+                "--no-newline",
+                "--type",
+                if image { "image/png" } else { "text" },
+            ]),
+            None,
+        )?;
+        if !success {
+            return Ok(None);
+        }
+        if image {
+            Ok(Some(Content::Png(output)))
+        } else {
+            if output.len() > MAX_TEXT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "clipboard text exceeds 1 MiB",
+                ));
+            }
+            let text = String::from_utf8(output).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "clipboard is not UTF-8")
+            })?;
+            Ok(Some(Content::Text(text)))
+        }
     }
 
-    fn write(&mut self, text: &str) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        let mut command = {
-            let mut command = Command::new("wl-copy");
-            command.args(["--type", "text/plain;charset=utf-8"]);
-            command
+    fn write(&mut self, content: &Content) -> io::Result<()> {
+        let mime = match content {
+            Content::Text(_) => "text/plain;charset=utf-8",
+            Content::Png(_) => "image/png",
         };
-        #[cfg(target_os = "macos")]
-        let mut command = Command::new("/usr/bin/pbcopy");
-        if execute(&mut command, Some(text.as_bytes()))?.0 {
+        if execute(
+            Command::new("wl-copy").args(["--type", mime]),
+            Some(content.payload()),
+        )?
+        .0
+        {
             Ok(())
         } else {
             Err(io::Error::other("clipboard command failed"))
@@ -63,6 +116,7 @@ impl Clipboard for SystemClipboard {
 }
 
 /// Bound command execution and output, including clipboard owners that stop responding.
+#[cfg(target_os = "linux")]
 fn execute(command: &mut Command, input: Option<&[u8]>) -> io::Result<(bool, Vec<u8>)> {
     command
         .stdin(if input.is_some() {
@@ -89,13 +143,13 @@ fn execute(command: &mut Command, input: Option<&[u8]>) -> io::Result<(bool, Vec
         let mut output = Vec::new();
         if let Some(stdout) = stdout {
             stdout
-                .take((MAX_TEXT_BYTES + 1) as u64)
+                .take((MAX_IMAGE_BYTES + 1) as u64)
                 .read_to_end(&mut output)?;
         }
-        if output.len() > MAX_TEXT_BYTES {
+        if output.len() > MAX_IMAGE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "clipboard exceeds 1 MiB",
+                "clipboard exceeds 16 MiB",
             ));
         }
         Ok(output)
@@ -126,6 +180,7 @@ fn execute(command: &mut Command, input: Option<&[u8]>) -> io::Result<(bool, Vec
     Ok((status?, output?))
 }
 
+#[cfg(target_os = "linux")]
 pub fn spawn_server(bind: &str, port: u16) -> io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
     thread::spawn(move || {
@@ -143,7 +198,7 @@ pub fn spawn_server(bind: &str, port: u16) -> io::Result<()> {
     Ok(())
 }
 
-pub fn spawn_client(host: String, port: u16) {
+pub fn spawn_client(host: String, port: u16, mut clipboard: impl Clipboard + Send + 'static) {
     thread::spawn(move || loop {
         let result = (host.as_str(), port)
             .to_socket_addrs()
@@ -151,7 +206,7 @@ pub fn spawn_client(host: String, port: u16) {
                 let mut last = io::Error::other("clipboard host has no addresses");
                 for address in addresses {
                     match TcpStream::connect_timeout(&address, IO_TIMEOUT) {
-                        Ok(stream) => return session(stream, &mut SystemClipboard),
+                        Ok(stream) => return session(stream, &mut clipboard),
                         Err(error) => last = error,
                     }
                 }
@@ -165,7 +220,7 @@ pub fn spawn_client(host: String, port: u16) {
 }
 
 /// Run a bidirectional session. Partial reads retain their bytes across timeouts.
-/// The only variable-size records are bounded UTF-8 text; PING has no payload.
+/// Records contain a type byte followed by bounded UTF-8 text or PNG bytes.
 pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -211,23 +266,54 @@ pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Res
                 incoming.drain(..4);
                 continue;
             }
-            if size as usize > MAX_TEXT_BYTES {
+            if size == 0 || size as usize > MAX_IMAGE_BYTES + 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "clipboard exceeds 1 MiB",
+                    "invalid clipboard record size",
+                ));
+            }
+            if incoming.len() < 5 {
+                break;
+            }
+            let limit = match incoming[4] {
+                0 => MAX_TEXT_BYTES,
+                1 => MAX_IMAGE_BYTES,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown clipboard type",
+                    ))
+                }
+            };
+            if size as usize > limit + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "clipboard payload exceeds limit",
                 ));
             }
             let end = 4 + size as usize;
             if incoming.len() < end {
                 break;
             }
-            let text = std::str::from_utf8(&incoming[4..end]).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "clipboard is not UTF-8")
-            })?;
-            if previous.as_deref() != Some(text) {
-                match clipboard.write(text) {
+            let payload = &incoming[5..end];
+            let content = match incoming[4] {
+                0 => Content::Text(String::from_utf8(payload.to_vec()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "clipboard is not UTF-8")
+                })?),
+                _ => {
+                    if !payload.starts_with(b"\x89PNG\r\n\x1a\n") {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "clipboard image is not PNG",
+                        ));
+                    }
+                    Content::Png(payload.to_vec())
+                }
+            };
+            if previous.as_ref() != Some(&content) {
+                match clipboard.write(&content) {
                     Ok(()) => {
-                        previous = Some(text.to_owned());
+                        previous = Some(content);
                         initialized = true;
                         backend_failed = false;
                     }
@@ -245,11 +331,14 @@ pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Res
                         initialized = true;
                     } else if current != previous {
                         let mut accepted = true;
-                        if let Some(text) = &current {
-                            if text.len() <= MAX_TEXT_BYTES {
-                                let mut record = Vec::with_capacity(4 + text.len());
-                                record.extend_from_slice(&(text.len() as u32).to_be_bytes());
-                                record.extend_from_slice(text.as_bytes());
+                        if let Some(content) = &current {
+                            let payload = content.payload();
+                            if payload.len() <= content.limit() {
+                                let mut record = Vec::with_capacity(5 + payload.len());
+                                record
+                                    .extend_from_slice(&((payload.len() + 1) as u32).to_be_bytes());
+                                record.push(content.kind());
+                                record.extend_from_slice(payload);
                                 accepted = outgoing.send(record)?;
                                 if accepted {
                                     last_sent = Instant::now();
@@ -293,7 +382,7 @@ impl Outgoing {
         let worker = thread::spawn(move || {
             while let Ok(record) = rx.recv() {
                 if writer.write_all(&record).is_err() {
-                    let _ = writer.shutdown(std::net::Shutdown::Both);
+                    let _ = writer.shutdown(net::Shutdown::Both);
                     break;
                 }
             }
@@ -319,7 +408,7 @@ impl Outgoing {
 
 impl Drop for Outgoing {
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        let _ = self.stream.shutdown(net::Shutdown::Both);
         self.tx.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

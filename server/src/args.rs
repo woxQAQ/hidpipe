@@ -30,7 +30,7 @@ Options:
   --mouse <substr>     match mouse device name (default auto-detect)
   --openlogi-socket <path>  capture the mouse through an OpenLogi bridge
   --swap-caps-esc      swap caps and esc for keys sent to the remote
-  --clipboard         share text clipboard over a separate trusted-LAN connection
+  --clipboard         share text and images over a separate trusted-LAN connection
   --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
   --latency-stats      log local timing summaries every 5 seconds
   -h, --help           show this help

@@ -33,7 +33,7 @@ in
     };
 
     clipboard = {
-      enable = lib.mkEnableOption "bidirectional text clipboard sharing over the trusted LAN";
+      enable = lib.mkEnableOption "bidirectional text and image clipboard sharing over the trusted LAN";
       port = lib.mkOption {
         type = lib.types.port;
         default = 24801;
