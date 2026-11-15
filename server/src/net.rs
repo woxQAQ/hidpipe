@@ -25,9 +25,43 @@ pub enum NetMsg {
     /// The client asks to hand control back (cursor pushed against the
     /// Mac's left edge).
     ReturnToLocal(u64),
-    /// The connection is dead (read timeout, write failure, peer closed,
-    /// bad handshake). Carries the connection generation.
+    /// The connection is dead (read timeout, write failure, peer closed).
+    /// Carries the connection generation.
     Dead(u64),
+    /// The connection never became the serving one: its first frame was not
+    /// a version-matching Hello. Admission control: a peer that cannot
+    /// handshake must not displace a healthy connection.
+    Rejected(u64, Rejection),
+}
+
+/// Why a pending connection failed admission. Judged from the first frame
+/// only, so a stray or outdated peer on the port cannot displace a serving
+/// connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// The peer closed before sending anything.
+    Closed,
+    /// Nothing arrived within the read timeout.
+    Silent,
+    /// A frame that was not a Hello.
+    Unexpected,
+    /// A Hello from another protocol version.
+    Version(u8),
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Closed => write!(f, "closed before the hello"),
+            Self::Silent => write!(f, "no hello within {READ_TIMEOUT:?}"),
+            Self::Unexpected => write!(f, "first frame was not a hello"),
+            Self::Version(version) => write!(
+                f,
+                "protocol version {version}, this server speaks {}",
+                proto::VERSION
+            ),
+        }
+    }
 }
 
 struct QueuedFrame {
@@ -132,19 +166,32 @@ fn writer_loop(
 
 fn reader_loop(mut stream: TcpStream, tx: Sender<QueuedFrame>, net_tx: Sender<NetMsg>, id: u64) {
     // The first frame must be a version-matching Hello, otherwise the
-    // connection is declared dead at once. A connection that fails the
+    // connection is rejected at once. A connection that fails the
     // handshake must not displace the serving one. This is admission
     // control at the protocol level: it keeps other clients on the same
     // port (such as deskflow's retry loop) from knocking out a healthy
     // connection.
-    match proto::read_frame(&mut stream) {
+    let rejection = match proto::read_frame(&mut stream) {
         Ok(Frame::Hello { version, openlogi }) if version == proto::VERSION => {
             let _ = net_tx.send(NetMsg::Hello(id, openlogi));
+            None
         }
-        _ => {
-            let _ = net_tx.send(NetMsg::Dead(id));
-            return;
+        Ok(Frame::Hello { version, .. }) => Some(Rejection::Version(version)),
+        Ok(_) => Some(Rejection::Unexpected),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Some(Rejection::Closed),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Some(Rejection::Silent)
         }
+        Err(_) => Some(Rejection::Unexpected),
+    };
+    if let Some(reason) = rejection {
+        let _ = net_tx.send(NetMsg::Rejected(id, reason));
+        return;
     }
     loop {
         match proto::read_frame(&mut stream) {

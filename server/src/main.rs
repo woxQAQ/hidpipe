@@ -19,7 +19,7 @@ mod hid;
 mod net;
 
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -31,8 +31,13 @@ use hidpipe_proto::{bridge::Capture, clipboard, ButtonState, Frame, KeyState, Mo
 
 use args::Args;
 use barrier::BarrierEvent;
-use net::{Connection, NetMsg};
+use net::{Connection, NetMsg, Rejection};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+/// Repeated admission failures (an outdated client retrying in a loop, a
+/// scanner) must stay visible without filling the journal: one line per new
+/// offender, then a summary at this interval.
+const REJECTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -127,6 +132,9 @@ fn main() -> io::Result<()> {
         net_tx,
         net_rx,
         barrier_rx,
+        handshake_rejections: 0,
+        rejection_report: None,
+        last_rejection: None,
     };
 
     loop {
@@ -170,6 +178,14 @@ struct App {
     net_tx: mpsc::Sender<NetMsg>,
     net_rx: mpsc::Receiver<NetMsg>,
     barrier_rx: mpsc::Receiver<BarrierEvent>,
+    /// Admission failures since the last log line; see
+    /// [`REJECTION_REPORT_INTERVAL`].
+    handshake_rejections: u32,
+    /// When the rejection counters last produced a log line.
+    rejection_report: Option<Instant>,
+    /// Last logged offender, so a new peer or a new reason logs at once. The
+    /// port is not part of the identity: a retrying client changes it.
+    last_rejection: Option<(IpAddr, Rejection)>,
     /// Barrier arming state: disarmed on entering remote mode, re-armed when
     /// the pointer leaves the barrier. Prevents an immediate bounce back to
     /// remote when the pointer still sits on the barrier after switching
@@ -183,7 +199,6 @@ impl App {
     /// own when its channel closes.
     fn accept_pending(&mut self) {
         while let Ok((stream, addr)) = self.listener.accept() {
-            log!("pending connection: {addr}");
             self.conn_id += 1;
             match Connection::spawn(
                 stream,
@@ -215,9 +230,16 @@ impl App {
                         self.conn = Some(conn);
                     }
                 }
+                NetMsg::Rejected(id, reason) => {
+                    if let Some((_, addr)) = self.pending.as_ref().filter(|(c, _)| c.id == id) {
+                        let addr = *addr;
+                        self.pending = None;
+                        self.log_rejection(addr, reason);
+                    }
+                }
                 NetMsg::Dead(id) => {
                     if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
-                        log!("pending connection failed handshake, dropped");
+                        log!("pending connection failed before the handshake");
                         self.pending = None;
                     }
                     if self.conn.as_ref().is_some_and(|c| c.id == id) {
@@ -234,6 +256,27 @@ impl App {
                 }
             }
         }
+    }
+
+    fn log_rejection(&mut self, addr: SocketAddr, reason: Rejection) {
+        self.handshake_rejections += 1;
+        let changed = self.last_rejection != Some((addr.ip(), reason));
+        let due = self
+            .rejection_report
+            .is_none_or(|reported| reported.elapsed() >= REJECTION_REPORT_INTERVAL);
+        if !changed && !due {
+            return;
+        }
+        let total = std::mem::take(&mut self.handshake_rejections);
+        if changed {
+            log!("rejected connection from {addr}: {reason}");
+        } else {
+            log!(
+                "{total} connection rejections since the last report (last from {addr}: {reason})"
+            );
+        }
+        self.last_rejection = Some((addr.ip(), reason));
+        self.rejection_report = Some(Instant::now());
     }
 
     fn drain_barrier(&mut self) {

@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use hidpipe_proto::{self as proto, Frame, KeyState};
-use net::{Connection, NetMsg};
+use net::{Connection, NetMsg, Rejection};
 
 #[test]
 fn feedback_preserves_input_order_and_does_not_echo() {
@@ -78,6 +78,57 @@ fn feedback_preserves_input_order_and_does_not_echo() {
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         NetMsg::Dead(42)
+    ));
+    drop(connection);
+}
+
+/// Admission control: a peer that cannot handshake is rejected with a reason
+/// and never reaches the serving slot.
+#[test]
+fn rejection_reports_why_admission_failed() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let closed = TcpStream::connect(address).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let connection = Connection::spawn(stream, tx, 1, false).unwrap();
+    closed.shutdown(Shutdown::Both).unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        NetMsg::Rejected(1, Rejection::Closed)
+    ));
+    drop(connection);
+
+    let mut outdated = TcpStream::connect(address).unwrap();
+    outdated
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let connection = Connection::spawn(stream, tx, 2, false).unwrap();
+    proto::write_frame(
+        &mut outdated,
+        &Frame::Hello {
+            version: proto::VERSION - 1,
+            openlogi: false,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        NetMsg::Rejected(2, Rejection::Version(version)) if version == proto::VERSION - 1
+    ));
+    drop(connection);
+
+    let mut foreign = TcpStream::connect(address).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let connection = Connection::spawn(stream, tx, 3, false).unwrap();
+    proto::write_frame(&mut foreign, &Frame::Ping).unwrap();
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        NetMsg::Rejected(3, Rejection::Unexpected)
     ));
     drop(connection);
 }

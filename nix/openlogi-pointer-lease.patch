@@ -1,0 +1,125 @@
+Pointer routing must survive the HID++ capture session's lifecycle.
+
+Ordinary pointer input arrives through the OS hook; the HID++ session only adds
+diverted controls (gesture button, thumbwheel, DPI buttons) and is re-armed
+whenever the device idles. The bridge used to require that session for a
+capture lease and to fault the lease when the session restarted, which kicked
+hidpipe back to local mode every re-arm.
+
+diff --git a/crates/openlogi-agent-core/src/remote.rs b/crates/openlogi-agent-core/src/remote.rs
+index a2b5cc0..4a779b2 100644
+--- a/crates/openlogi-agent-core/src/remote.rs
++++ b/crates/openlogi-agent-core/src/remote.rs
+@@ -54,7 +54,6 @@ pub struct Bridge {
+     profile: RwLock<Profile>,
+     key: RwLock<String>,
+     hook_ready: AtomicBool,
+-    hid_ready: AtomicBool,
+     capture_active: AtomicBool,
+     capture_fault: AtomicBool,
+     // Low byte: physical holds. High byte: remote holds awaiting release.
+@@ -73,7 +72,6 @@ pub fn install(options: Options, config: &Config) -> io::Result<Arc<Bridge>> {
+         profile: RwLock::new(Profile::new(config, &options.device, None)),
+         key: RwLock::new(options.device.clone()),
+         hook_ready: AtomicBool::new(false),
+-        hid_ready: AtomicBool::new(false),
+         capture_active: AtomicBool::new(false),
+         capture_fault: AtomicBool::new(false),
+         buttons: AtomicU16::new(0),
+@@ -134,7 +132,6 @@ pub fn publish(config: &Config, app: Option<&str>, fallback: Option<&str>) {
+             &bridge.options.device
+         };
+         if *key != selected {
+-            bridge.hid_ready.store(false, Ordering::Release);
+             bridge.capture_fault.store(true, Ordering::Release);
+             selected.clone_into(&mut key);
+         }
+@@ -240,11 +237,13 @@ impl Bridge {
+ 
+     fn capture_connection(self: &Arc<Self>, mut stream: UnixStream) -> io::Result<()> {
+         let (events, receiver) = mpsc::sync_channel(1024);
+-        if !self.hook_ready.load(Ordering::Acquire) || !self.hid_ready.load(Ordering::Acquire) {
++        // Ordinary pointer input comes from the OS hook; the HID++ session only
++        // adds diverted controls (gesture button, thumbwheel, DPI buttons) and
++        // is re-armed in the background whenever the device idles. Requiring it
++        // here would refuse the lease on every re-arm.
++        if !self.hook_ready.load(Ordering::Acquire) {
+             stream.write_all(&[1])?;
+-            return Err(io::Error::other(
+-                "pointer hook or HID++ capture is not ready",
+-            ));
++            return Err(io::Error::other("pointer hook is not ready"));
+         }
+         let alive = Arc::new(AtomicBool::new(true));
+         {
+@@ -460,18 +459,14 @@ pub fn captured(key: &str, input: CapturedInput) -> bool {
+         return false;
+     };
+     let event = match input {
+-        CapturedInput::Ready => {
+-            bridge.hid_ready.store(true, Ordering::Release);
+-            None
+-        }
++        CapturedInput::Ready => None,
+         CapturedInput::Interrupted => {
+-            bridge.hid_ready.store(false, Ordering::Release);
+-            bridge.capture_fault.store(true, Ordering::Release);
+-            // A stopped HID++ session cannot deliver releases for its controls.
+-            // Native buttons remain tracked by the independent OS hook.
++            // A stopped HID++ session cannot deliver releases for its diverted
++            // controls, but pointer routing continues through the OS hook. Drop
++            // only the HID++ holds and tell the active route to release them;
++            // the lease itself must survive the re-arm.
+             bridge.buttons.fetch_and(0x1f1f, Ordering::SeqCst);
+-            bridge.local(PointerEvent::Reset);
+-            None
++            Some(PointerEvent::Reset)
+         }
+         CapturedInput::RawButton { button, pressed } => {
+             button_number(button).map(|button| PointerEvent::Button { button, pressed })
+diff --git a/crates/openlogi-agent-core/tests/remote_bridge.rs b/crates/openlogi-agent-core/tests/remote_bridge.rs
+index 9a66f76..ba474b2 100644
+--- a/crates/openlogi-agent-core/tests/remote_bridge.rs
++++ b/crates/openlogi-agent-core/tests/remote_bridge.rs
+@@ -230,6 +230,34 @@ fn interrupted_controls_recover(socket: &Path) {
+     );
+ }
+ 
++/// The HID++ session is re-armed whenever the device idles; that must not take
++/// the pointer lease with it. Only the diverted controls are released.
++fn interrupted_controls_keep_the_lease(socket: &Path) {
++    let (mut capture, ack) = connect(socket, 0);
++    assert_eq!(ack, 0);
++    assert!(remote::captured("mouse", CapturedInput::Interrupted));
++    assert_eq!(
++        PointerEvent::read(&mut capture).unwrap(),
++        PointerEvent::Reset,
++        "the interrupted HID++ controls are released remotely"
++    );
++    assert!(remote::captured("mouse", CapturedInput::Ready));
++    assert!(matches!(
++        remote::hook_input(&MouseEvent::Moved {
++            delta_x: 2,
++            delta_y: -1,
++        }),
++        Some(EventDisposition::Suppress),
++        "pointer routing continues through the OS hook"
++    ));
++    assert_eq!(
++        PointerEvent::read(&mut capture).unwrap(),
++        PointerEvent::Motion { dx: 2, dy: -1 }
++    );
++    let (_, ack) = connect(socket, 0);
++    assert_eq!(ack, 1, "a HID++ re-arm must not release the pointer lease");
++}
++
+ #[test]
+ fn local_socket_routes_before_bindings_and_cleans_up_leases() {
+     let directory =
+@@ -253,5 +281,6 @@ fn local_socket_routes_before_bindings_and_cleans_up_leases() {
+     #[cfg(target_os = "linux")]
+     capture_recovery(&socket, capture_records(&socket));
+     interrupted_controls_recover(&socket);
++    interrupted_controls_keep_the_lease(&socket);
+     std::fs::remove_dir_all(directory).unwrap();
+ }

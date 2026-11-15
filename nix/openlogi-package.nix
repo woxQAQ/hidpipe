@@ -28,6 +28,7 @@ openlogi.overrideAttrs (
       ./openlogi-reporting-recovery.patch
       ./openlogi-repeat-gestures.patch
       ./openlogi-managed-restart.patch
+      ./openlogi-pointer-lease.patch
     ];
     postPatch =
       (old.postPatch or "")

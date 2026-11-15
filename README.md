@@ -46,7 +46,7 @@ Three input-channel design invariants:
 
 Earlier iterations rejected pseudo edge detection that accumulates deltas to estimate cursor position, because estimation always drifts. `hidpipe` uses two deterministic paths instead:
 
-- **Linux → macOS:** Push the cursor past the right edge of the Linux screen. The trigger is a Wayland layer-shell barrier, so the compositor itself detects the crossing. In remote mode, Linux input devices are grabbed (freezing the local cursor) and all input goes to the Mac.
+- **Linux → macOS:** Push the cursor past the right boundary of the Linux desktop. The trigger is a Wayland layer-shell barrier, so the compositor itself detects the crossing. Only outputs that touch the desktop's right boundary carry a barrier; seams between local monitors let the cursor through and never take control away. In remote mode, Linux input devices are grabbed (freezing the local cursor) and all input goes to the Mac.
 - **macOS → Linux:** Push the cursor against the left edge of the Mac display and keep pushing to hand control back. The client clamps cursor coordinates precisely and triggers return once leftward pressure within a sliding window exceeds the threshold.
 
 ## Build and manual usage
@@ -378,7 +378,7 @@ The old `--expected-fixed` plus `--expected-count` mode remains available for hi
 - **Plain TCP:** Intended for trusted LANs only; TLS is on the roadmap.
 - **Media keys:** Volume and playback keys (HID Consumer Page `0x0C`) are not mapped yet; only Keyboard/Keypad Page (`0x07`) usages are forwarded.
 - **macOS `SecureEventInput`:** When a password prompt or secure text field has focus on macOS, the system discards synthetic keyboard events from user-space injectors by policy.
-- **Single-display geometry:** On Linux, the right-edge barrier is placed on every output (so seams between monitors also trigger it). On macOS, cursor movement and left-edge return detection are clamped to the main display.
+- **Single-display geometry on macOS:** On Linux, barrier placement follows the output layout: every output is probed for its logical size, and only those touching the desktop's right boundary are barriers, so interior seams pass through and monitor hotplug or mode changes are picked up. On macOS, cursor movement and left-edge return detection are still clamped to the main display.
 - **Device hot-plug:** Losing the keyboard device (including restarting `keyd`) releases remote input and exits so `systemd` can restart the server and reopen the device. A directly captured `evdev` mouse also requires a server restart after hot-plug.
 - **Native `evdev` side buttons:** Back and forward mouse buttons are forwarded with the OpenLogi backend; native `evdev` capture forwards left, right, and middle buttons.
 
@@ -386,7 +386,7 @@ The old `--expected-fixed` plus `--expected-count` mode remains available for hi
 
 - [ ] TLS (self-signed certificate pair, fingerprint authentication)
 - [x] Nix modules: `systemd` user service on Linux, `launchd` agent on macOS
-- [ ] Multi-monitor support: per-output barrier configuration on Linux, cursor clamping across displays on macOS
+- [ ] Multi-monitor on macOS: clamp cursor movement across all displays and detect the return edge on the leftmost one
 - [ ] Map the Mac cursor's initial Y coordinate by screen height ratio when entering remote mode
 - [ ] Media keys (HID Consumer Page)
 - [x] Bidirectional text and PNG clipboard sync
