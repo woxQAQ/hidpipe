@@ -78,16 +78,40 @@ index a2b5cc0..4a779b2 100644
          CapturedInput::RawButton { button, pressed } => {
              button_number(button).map(|button| PointerEvent::Button { button, pressed })
 diff --git a/crates/openlogi-agent-core/tests/remote_bridge.rs b/crates/openlogi-agent-core/tests/remote_bridge.rs
-index 9a66f76..ba474b2 100644
+index 9a66f76..ca9e3d5 100644
 --- a/crates/openlogi-agent-core/tests/remote_bridge.rs
 +++ b/crates/openlogi-agent-core/tests/remote_bridge.rs
-@@ -230,6 +230,34 @@ fn interrupted_controls_recover(socket: &Path) {
+@@ -79,10 +79,7 @@ fn destination_profile(socket: &Path, config: &mut Config) {
+ #[cfg(target_os = "linux")]
+ fn capture_records(socket: &Path) -> UnixStream {
+     let (_, ack) = connect(socket, 0);
+-    assert_eq!(
+-        ack, 1,
+-        "capture refuses before the native hook and HID++ are ready"
+-    );
++    assert_eq!(ack, 1, "capture refuses before the native hook is ready");
+     remote::hook_ready(true);
+     assert!(remote::captured("mouse", CapturedInput::Ready));
+     let native_down = MouseEvent::Button {
+@@ -230,6 +227,45 @@ fn interrupted_controls_recover(socket: &Path) {
      );
  }
  
 +/// The HID++ session is re-armed whenever the device idles; that must not take
 +/// the pointer lease with it. Only the diverted controls are released.
 +fn interrupted_controls_keep_the_lease(socket: &Path) {
++    let motion = MouseEvent::Moved {
++        delta_x: 2,
++        delta_y: -1,
++    };
++    let deadline = Instant::now() + Duration::from_secs(2);
++    while remote::hook_input(&motion).is_some() {
++        assert!(
++            Instant::now() < deadline,
++            "the previous lease must be released first"
++        );
++        std::thread::sleep(Duration::from_millis(5));
++    }
 +    let (mut capture, ack) = connect(socket, 0);
 +    assert_eq!(ack, 0);
 +    assert!(remote::captured("mouse", CapturedInput::Interrupted));
@@ -97,14 +121,13 @@ index 9a66f76..ba474b2 100644
 +        "the interrupted HID++ controls are released remotely"
 +    );
 +    assert!(remote::captured("mouse", CapturedInput::Ready));
-+    assert!(matches!(
-+        remote::hook_input(&MouseEvent::Moved {
-+            delta_x: 2,
-+            delta_y: -1,
-+        }),
-+        Some(EventDisposition::Suppress),
++    assert!(
++        matches!(
++            remote::hook_input(&motion),
++            Some(EventDisposition::Suppress)
++        ),
 +        "pointer routing continues through the OS hook"
-+    ));
++    );
 +    assert_eq!(
 +        PointerEvent::read(&mut capture).unwrap(),
 +        PointerEvent::Motion { dx: 2, dy: -1 }
@@ -116,7 +139,7 @@ index 9a66f76..ba474b2 100644
  #[test]
  fn local_socket_routes_before_bindings_and_cleans_up_leases() {
      let directory =
-@@ -253,5 +281,6 @@ fn local_socket_routes_before_bindings_and_cleans_up_leases() {
+@@ -253,5 +289,6 @@ fn local_socket_routes_before_bindings_and_cleans_up_leases() {
      #[cfg(target_os = "linux")]
      capture_recovery(&socket, capture_records(&socket));
      interrupted_controls_recover(&socket);
