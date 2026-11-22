@@ -13,6 +13,8 @@ let
   };
 in
 {
+  imports = [ ./common.nix ];
+
   options.services.hidpipe = server.options // {
     openlogi = openlogi.options;
     user = lib.mkOption {
@@ -28,7 +30,7 @@ in
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open the server TCP port in the firewall.";
+      description = "Open the input TCP port and, when clipboard sharing is enabled, the clipboard TCP port in the firewall.";
     };
   };
 

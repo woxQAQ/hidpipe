@@ -9,3 +9,6 @@ default-members = ["proto", "server"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
+
+[workspace.dependencies]
+fastrace = { version = "0.7.19", features = ["enable"] }

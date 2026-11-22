@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 core-foundation = "0.10"
+fastrace.workspace = true
 core-graphics = { version = "0.25", features = ["highsierra"] }
 # Releases held keys on SIGTERM/SIGINT so no keys get stuck at the system
 # level.

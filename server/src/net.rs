@@ -6,11 +6,13 @@
 //! to ignore late death notices from superseded connections.
 
 use std::net::TcpStream;
+use std::num::NonZeroU32;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{io, net};
 
+use fastrace::{collector::SpanContext, Span};
 use hidpipe_proto as proto;
 use hidpipe_proto::latency::LatencyStats;
 use proto::Frame;
@@ -21,7 +23,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(6);
 pub enum NetMsg {
     /// The pending connection's first frame was a version-matching Hello;
     /// it may take over.
-    Hello(u64, bool),
+    Hello {
+        id: u64,
+        openlogi: bool,
+        supports_trace: bool,
+    },
     /// The client asks to hand control back (cursor pushed against the
     /// Mac's left edge).
     ReturnToLocal(u64),
@@ -57,8 +63,9 @@ impl std::fmt::Display for Rejection {
             Self::Unexpected => write!(f, "first frame was not a hello"),
             Self::Version(version) => write!(
                 f,
-                "protocol version {version}, this server speaks {}",
-                proto::VERSION
+                "unsupported input protocol version {version} (supported: {}, {})",
+                proto::VERSION,
+                proto::TRACE_VERSION
             ),
         }
     }
@@ -67,12 +74,20 @@ impl std::fmt::Display for Rejection {
 struct QueuedFrame {
     frame: Frame,
     queued_at: Option<Instant>,
+    trace: Option<Box<ForwardTrace>>,
+}
+
+struct ForwardTrace {
+    forward: Span,
+    queue: Span,
 }
 
 pub struct Connection {
     pub id: u64,
     tx: Sender<QueuedFrame>,
     latency_stats: bool,
+    pub trace_every: Option<NonZeroU32>,
+    until_sample: u32,
     shutdown: TcpStream,
 }
 
@@ -100,14 +115,30 @@ impl Connection {
             id,
             tx,
             latency_stats,
+            trace_every: None,
+            until_sample: 0,
             shutdown,
         })
     }
 
     /// A failed send means the peer is dead; the read/write threads report
     /// Dead shortly after, so the frame is dropped silently here.
-    pub fn send(&self, frame: Frame) {
+    pub fn send(&mut self, frame: Frame) {
+        let trace = self
+            .trace_every
+            .filter(|_| frame.is_input())
+            .and_then(|every| {
+                if self.until_sample > 0 {
+                    self.until_sample -= 1;
+                    return None;
+                }
+                self.until_sample = every.get() - 1;
+                let forward = Span::root("server.forward", SpanContext::random());
+                let queue = Span::enter_with_parent("server.queue", &forward);
+                Some(Box::new(ForwardTrace { forward, queue }))
+            });
         let _ = self.tx.send(QueuedFrame {
+            trace,
             frame,
             queued_at: self.latency_stats.then(Instant::now),
         });
@@ -135,24 +166,37 @@ fn writer_loop(
     // 6s.
     let mut next_ping = Instant::now() + PING_INTERVAL;
     loop {
-        let frame = match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
-            Ok(queued) => {
-                if let (Some(stats), Some(started)) = (stats.as_mut(), queued.queued_at) {
-                    stats.record(0, started.elapsed());
+        let (frame, trace) =
+            match rx.recv_timeout(next_ping.saturating_duration_since(Instant::now())) {
+                Ok(queued) => {
+                    if let (Some(stats), Some(started)) = (stats.as_mut(), queued.queued_at) {
+                        stats.record(0, started.elapsed());
+                    }
+                    let forward = queued.trace.map(|trace| {
+                        drop(trace.queue);
+                        trace.forward
+                    });
+                    (queued.frame, forward)
                 }
-                queued.frame
-            }
-            Err(RecvTimeoutError::Timeout) => Frame::Ping,
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                return;
-            }
-        };
+                Err(RecvTimeoutError::Timeout) => (Frame::Ping, None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            };
         if matches!(frame, Frame::Ping) {
             next_ping = Instant::now() + PING_INTERVAL;
         }
         let started = stats.as_ref().map(|_| Instant::now());
-        let result = proto::write_frame(&mut stream, &frame);
+        let result = if let Some(forward) = trace {
+            let write = Span::enter_with_parent("server.write", &forward);
+            match SpanContext::from_span(&write) {
+                Some(context) => proto::write_trace_frame(&mut stream, &frame, context),
+                None => proto::write_frame(&mut stream, &frame),
+            }
+        } else {
+            proto::write_frame(&mut stream, &frame)
+        };
         if let (Some(stats), Some(started)) = (stats.as_mut(), started) {
             stats.record(1, started.elapsed());
             stats.report_if_due();
@@ -172,8 +216,14 @@ fn reader_loop(mut stream: TcpStream, tx: Sender<QueuedFrame>, net_tx: Sender<Ne
     // port (such as deskflow's retry loop) from knocking out a healthy
     // connection.
     let rejection = match proto::read_frame(&mut stream) {
-        Ok(Frame::Hello { version, openlogi }) if version == proto::VERSION => {
-            let _ = net_tx.send(NetMsg::Hello(id, openlogi));
+        Ok(Frame::Hello { version, openlogi })
+            if matches!(version, proto::VERSION | proto::TRACE_VERSION) =>
+        {
+            let _ = net_tx.send(NetMsg::Hello {
+                id,
+                openlogi,
+                supports_trace: version == proto::TRACE_VERSION,
+            });
             None
         }
         Ok(Frame::Hello { version, .. }) => Some(Rejection::Version(version)),
@@ -199,6 +249,7 @@ fn reader_loop(mut stream: TcpStream, tx: Sender<QueuedFrame>, net_tx: Sender<Ne
                 let _ = tx.send(QueuedFrame {
                     frame: Frame::Pong,
                     queued_at: None,
+                    trace: None,
                 });
             }
             Ok(Frame::ReturnToLocal) => {

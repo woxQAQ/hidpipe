@@ -43,8 +43,11 @@ fn feedback_precedes_injection_and_can_be_disabled() {
             transport::run(
                 &mut client,
                 None,
-                feedback,
-                true,
+                transport::Options {
+                    input_feedback: feedback,
+                    latency_stats: true,
+                    trace_enabled: false,
+                },
                 |received| {
                     entered.send(received).unwrap();
                     resumed.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -113,8 +116,11 @@ fn feedback_does_not_bypass_binding_disposition_or_reset() {
         transport::run(
             &mut client,
             Some(&mut resolver),
-            true,
-            true,
+            transport::Options {
+                input_feedback: true,
+                latency_stats: true,
+                trace_enabled: false,
+            },
             |frame| {
                 injected.send(frame).unwrap();
                 None

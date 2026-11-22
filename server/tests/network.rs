@@ -2,6 +2,8 @@
 
 #[path = "../src/net.rs"]
 mod net;
+#[path = "../../client/src/transport.rs"]
+mod transport;
 
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -22,7 +24,7 @@ fn feedback_preserves_input_order_and_does_not_echo() {
         .unwrap();
     let (stream, _) = listener.accept().unwrap();
     let (tx, rx) = mpsc::channel();
-    let connection = Connection::spawn(stream, tx, 42, true).unwrap();
+    let mut connection = Connection::spawn(stream, tx, 42, true).unwrap();
     assert_eq!(connection.id, 42);
     proto::write_frame(
         &mut client,
@@ -34,7 +36,11 @@ fn feedback_preserves_input_order_and_does_not_echo() {
     .unwrap();
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        NetMsg::Hello(42, true)
+        NetMsg::Hello {
+            id: 42,
+            openlogi: true,
+            supports_trace: false
+        }
     ));
 
     // The Mac's per-input Pong must never create a reply loop or consume
@@ -80,6 +86,162 @@ fn feedback_preserves_input_order_and_does_not_echo() {
         NetMsg::Dead(42)
     ));
     drop(connection);
+}
+
+/// Exercise both process-local reporters and the parent IDs received by an OTLP sink.
+#[test]
+fn sampled_inputs_cross_processes() {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use prost::Message;
+    use std::{process::Command, sync::Arc, thread};
+
+    const CHILD_ADDR: &str = "HIDPIPE_TEST_INPUT_ADDR";
+    const ENDPOINT: &str = "HIDPIPE_TEST_OTLP_URL";
+    let timeout = Duration::from_secs(5);
+    let frames = [
+        Frame::Motion { dx: 1, dy: 0 },
+        Frame::ReleaseAll,
+        Frame::Motion { dx: 2, dy: 0 },
+    ];
+    if let Ok(addr) = std::env::var(CHILD_ADDR) {
+        proto::trace::init("hidpipe-client", &std::env::var(ENDPOINT).unwrap()).unwrap();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        proto::write_frame(
+            &mut stream,
+            &Frame::Hello {
+                version: proto::TRACE_VERSION,
+                openlogi: false,
+            },
+        )
+        .unwrap();
+        let mut injected = Vec::new();
+        let result = transport::run(
+            &mut stream,
+            None,
+            transport::Options {
+                input_feedback: true,
+                latency_stats: false,
+                trace_enabled: true,
+            },
+            |frame| {
+                injected.push(frame);
+                (injected.len() == frames.len()).then_some(Frame::ReturnToLocal)
+            },
+            || true,
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(injected, frames);
+        fastrace::flush();
+        return;
+    }
+
+    let collector = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    let url = format!("http://{}/v1/traces", collector.server_addr());
+    let sink = thread::spawn({
+        let collector = Arc::clone(&collector);
+        move || {
+            let mut spans = Vec::new();
+            while let Ok(mut request) = collector.recv() {
+                assert_eq!(request.url(), "/v1/traces");
+                let mut bytes = Vec::new();
+                request.as_reader().read_to_end(&mut bytes).unwrap();
+                let export = ExportTraceServiceRequest::decode(&*bytes).unwrap();
+                for resource in export.resource_spans {
+                    let service = resource
+                        .resource
+                        .unwrap()
+                        .attributes
+                        .into_iter()
+                        .find(|attr| attr.key == "service.name")
+                        .unwrap()
+                        .value
+                        .unwrap()
+                        .value
+                        .unwrap();
+                    let Value::StringValue(service) = service else {
+                        panic!("invalid service name")
+                    };
+                    for scope in resource.scope_spans {
+                        spans.extend(scope.spans.into_iter().map(|span| (service.clone(), span)));
+                    }
+                }
+                request.respond(tiny_http::Response::empty(200)).unwrap();
+            }
+            spans
+        }
+    });
+    proto::trace::init("hidpipe-server", &url).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (accepted, socket) = mpsc::channel();
+    thread::spawn(move || accepted.send(listener.accept()).ok());
+    let mut client = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "sampled_inputs_cross_processes"])
+        .env(CHILD_ADDR, addr.to_string())
+        .env(ENDPOINT, url)
+        .spawn()
+        .unwrap();
+    let (stream, _) = socket.recv_timeout(timeout).unwrap().unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut conn = Connection::spawn(stream, tx, 1, false).unwrap();
+    assert!(matches!(
+        rx.recv_timeout(timeout).unwrap(),
+        NetMsg::Hello {
+            supports_trace: true,
+            ..
+        }
+    ));
+    conn.trace_every = std::num::NonZeroU32::new(2);
+    for frame in frames {
+        conn.send(frame);
+    }
+    assert!(matches!(
+        rx.recv_timeout(timeout).unwrap(),
+        NetMsg::ReturnToLocal(1)
+    ));
+    shutdown.shutdown(Shutdown::Write).unwrap();
+    assert!(client.wait().unwrap().success());
+    fastrace::flush();
+    collector.unblock();
+    let records = sink.join().unwrap();
+    let roots: Vec<_> = records
+        .iter()
+        .filter(|(_, s)| s.name == "server.forward")
+        .collect();
+    assert_eq!(roots.len(), 2);
+    assert_ne!(roots[0].1.trace_id, roots[1].1.trace_id);
+    for (_, root) in roots {
+        let span = |service: &str, name: &str| {
+            let mut matches = records
+                .iter()
+                .filter(|(svc, s)| svc == service && s.trace_id == root.trace_id && s.name == name);
+            let (_, record) = matches.next().unwrap();
+            assert!(matches.next().is_none());
+            record
+        };
+        let write = span("hidpipe-server", "server.write");
+        let process = span("hidpipe-client", "client.process");
+        assert_eq!(
+            span("hidpipe-server", "server.queue").parent_span_id,
+            root.span_id
+        );
+        assert_eq!(write.parent_span_id, root.span_id);
+        assert_eq!(process.parent_span_id, write.span_id);
+        assert_eq!(
+            span("hidpipe-client", "client.inject").parent_span_id,
+            process.span_id
+        );
+        assert_eq!(
+            span("hidpipe-client", "client.feedback").parent_span_id,
+            process.span_id
+        );
+    }
 }
 
 /// Admission control: a peer that cannot handshake is rejected with a reason

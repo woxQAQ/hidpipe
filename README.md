@@ -24,7 +24,7 @@ flowchart LR
         OL_L -.->|unmapped pointer events| S
         LCB[Wayland clipboard]
     end
-    subgraph Wire["wire protocol v1: no semantics"]
+    subgraph Wire["HID input over TCP"]
         S -->|"HID usage IDs + pointer frames<br/>plain TCP, TCP_NODELAY"| C
     end
     subgraph macOS["macOS (client)"]
@@ -101,6 +101,8 @@ While connected, the client holds a macOS power assertion against idle system sl
 | `--clipboard-port <port>` | `24801` | Clipboard listen port (requires `--clipboard`; must differ from the input port) |
 | `--swap-caps-esc` | off | Swap Caps Lock and Escape on capture (use only when `keyd` or `udev` does not already do so) |
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds |
+| `--trace-endpoint <url>` | disabled | Export sampled input spans to an OTLP/HTTP trace endpoint |
+| `--trace-every <n>` | `100` | Sample the first input and then one per `n` inputs on each trace-capable connection |
 
 | `hidpipe-client` | Default | Description |
 |---|---|---|
@@ -110,6 +112,7 @@ While connected, the client holds a macOS power assertion against idle system sl
 | `--latency-stats` | off | Log local stage timing summaries every 5 seconds and `[slow-inject]` records (`>= 2 ms`) |
 | `--clipboard` | off | Enable bidirectional text and image clipboard sharing with the Linux server |
 | `--clipboard-port <port>` | `24801` | Server clipboard port (requires `--clipboard`; must match the server) |
+| `--trace-endpoint <url>` | disabled | Accept trace envelopes and export client spans to an OTLP/HTTP trace endpoint |
 | `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
 | `--allow-idle-sleep` | off | Let macOS idle-sleep while connected; by default the client holds a power assertion so the Mac stays reachable (the display still sleeps) |
 | `--scroll-scale-x <f>` | `1.0` | Multiply horizontal Wheel input by a finite, non-negative value; `0` disables this axis |
@@ -233,29 +236,52 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 
 ### Module options reference
 
-| Option (`services.hidpipe.*`) | Default | Applies to | Description |
+All paths below are relative to `services.hidpipe`.
+
+#### Both peers
+
+| Option | Default | Description |
+|---|---|---|
+| `enable` | `false` | Enable the `hidpipe` service |
+| `package` | native `hidpipe` package | Provides `hidpipe-server` on Linux or `hidpipe-client` on macOS |
+| `port` | `24800` | Input TCP port used by both peers |
+| `clipboard.enable` | `false` | Enable on both peers to share text and images over the trusted LAN |
+| `clipboard.port` | `24801` | Clipboard TCP port. Set the same value on both peers and choose a port distinct from `port` |
+| `trace.endpoint` | `null` | Full OTLP/HTTP trace URL. Configure both peers to export to the same trace backend |
+| `latencyStats` | `false` | Log local latency counts, means, and maxima every 5 seconds |
+
+#### Linux capture server
+
+| Option | Default | Description |
+|---|---|---|
+| `bind` | `"0.0.0.0"` | Listen address for the server |
+| `keyboard` | `null` (auto-detect) | Keyboard device name substring |
+| `mouse` | `null` (auto-detect) | Mouse device name substring. Use `openlogi.mouse` and leave `mouse` unset when OpenLogi owns capture |
+| `swapCapsEsc` | `false` | Swap Caps Lock and Escape on capture |
+| `trace.sampleEvery` | `100` | Number of input frames between samples on each connection (`1` traces every input) |
+| `systemdTarget` | `"graphical-session.target"` | User systemd target that starts and stops the service |
+| `user` | required on NixOS | NixOS only. Desktop user who runs the server and joins the `input` group. Enabling OpenLogi also adds `uinput` |
+| `openFirewall` | `false` | NixOS only. Open the input TCP port and, when clipboard sharing is enabled, the clipboard TCP port |
+
+#### macOS client (Home Manager)
+
+| Option | Default | Description |
+|---|---|---|
+| `host` | `null` | Host name or IP address of the Linux server. Required when the service is enabled |
+| `localSigning.enable` | `true` on macOS | Install and locally sign stable app bundles in `~/Applications` |
+| `inputFeedback` | `false` | Reply with a `Pong` to each input frame to mitigate TCP delayed ACK |
+| `stayAwake` | `true` | Prevent idle system sleep while connected to the server so the Mac stays reachable at the screen edge. The display still sleeps |
+| `scroll.scaleX` | `1.0` | Horizontal Wheel multiplier. Accepts a finite, non-negative integer or float. `0` disables this axis |
+| `scroll.scaleY` | `1.0` | Vertical Wheel multiplier with the same range and zero behavior as `scroll.scaleX` |
+| `scroll.invertX` | `false` | Reverse horizontal Wheel input |
+| `scroll.invertY` | `false` | Reverse vertical Wheel input |
+
+HID++ thumbwheel actions use the destination OpenLogi profile's sensitivity and bindings.
+
+#### OpenLogi backend
+
+| Option | Default | Applies to | Description |
 |---|---|---|---|
-| `enable` | `false` | Linux, macOS | Enable the `hidpipe` service |
-| `package` | native `hidpipe` package | Linux, macOS | Package providing `hidpipe-server` or `hidpipe-client` |
-| `port` | `24800` | Linux, macOS | TCP port used by server and client |
-| `clipboard.enable` | `false` | Linux, macOS | Enable bidirectional text and image clipboard sharing on the trusted LAN |
-| `clipboard.port` | `24801` | Linux, macOS | Separate clipboard TCP port; use the same value on both peers |
-| `latencyStats` | `false` | Linux, macOS | Log local latency counts, means, and maxima every 5 seconds |
-| `user` | required | NixOS | Desktop user who runs the server and receives `input` (and `uinput`) group membership |
-| `openFirewall` | `false` | NixOS | Open `services.hidpipe.port` in the firewall |
-| `bind` | `"0.0.0.0"` | Linux | Listen address for the server |
-| `keyboard` | `null` (auto-detect) | Linux | Keyboard device name substring |
-| `mouse` | `null` (auto-detect) | Linux | Mouse device name substring (`null` required when `openlogi.enable = true`) |
-| `swapCapsEsc` | `false` | Linux | Swap Caps Lock and Escape on capture |
-| `systemdTarget` | `"graphical-session.target"` | Linux | User systemd target that starts and stops the service |
-| `host` | required on macOS | macOS (HM) | Host name or IP address of the Linux server |
-| `localSigning.enable` | `true` on macOS | macOS (HM) | Install and locally sign stable app bundles in `~/Applications` |
-| `inputFeedback` | `false` | macOS (HM) | Reply with a `Pong` to each input frame to mitigate TCP delayed ACK |
-| `stayAwake` | `true` | macOS (HM) | Prevent idle system sleep while connected to the server, so the Mac stays reachable at the screen edge; the display still sleeps |
-| `scroll.scaleX` | `1.0` | macOS (HM) | Finite, non-negative horizontal Wheel multiplier (integer or float); `0` disables this axis |
-| `scroll.scaleY` | `1.0` | macOS (HM) | Finite, non-negative vertical Wheel multiplier (integer or float); `0` disables this axis |
-| `scroll.invertX` | `false` | macOS (HM) | Reverse horizontal Wheel input; excludes HID++ thumbwheel actions |
-| `scroll.invertY` | `false` | macOS (HM) | Reverse vertical Wheel input; excludes HID++ thumbwheel actions |
 | `openlogi.enable` | `false` | Linux, macOS | Route mouse input through OpenLogi with destination-side bindings |
 | `openlogi.mouse` | `"MX Master"` | Linux | Physical Logitech mouse name substring (must match exactly one mouse) |
 | `openlogi.device` | `null` | Linux, macOS | OpenLogi config key (`null` selects the first online device on Linux or saved selection on macOS) |
@@ -268,7 +294,7 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 
 ## OpenLogi mouse backend
 
-Enable the OpenLogi backend on **both** peers to evaluate mouse bindings on the active destination machine instead of forwarding Linux-generated shortcuts. The bridge patch targets OpenLogi **0.6.25** (`nix/openlogi-package.nix`), sharing the wire protocol in `proto/src/pointer.rs`. The network protocol is version `1`; a version or pointer-backend mismatch is rejected during the `Hello` handshake before capture begins.
+Enable the OpenLogi backend on **both** peers to evaluate mouse bindings on the active destination machine instead of forwarding Linux-generated shortcuts. The bridge patch targets OpenLogi **0.6.25** (`nix/openlogi-package.nix`), sharing the wire protocol in `proto/src/pointer.rs`. The `Hello` handshake checks the input protocol version and pointer backend before capture begins.
 
 ### Configuration
 
@@ -325,6 +351,31 @@ services.hidpipe = {
 - **Hardware settings:** DPI, SmartShift, and other device-level settings belong to the Linux profile; the bridge does not forward hardware configuration changes from macOS back to the physical mouse.
 
 ## Diagnostics
+
+### Distributed input tracing
+
+Set the full OTLP/HTTP protobuf trace URL on both peers. The collectors may be local to each machine if they forward to the same backend. For example, with a collector listening on port 4318:
+
+```nix
+services.hidpipe.trace.endpoint = "http://collector.lan:4318/v1/traces"; # both peers
+services.hidpipe.trace.sampleEvery = 100; # Linux server
+```
+
+Switch to remote input, then search the trace backend for service `hidpipe-server` and operation `server.forward`. The first input on each connection is sampled, then one per `sampleEvery` frames. Set it to `1` for a short full capture. Sampling includes `ReleaseAll`. Heartbeats and clipboard transfers use their ordinary protocols.
+
+```mermaid
+flowchart LR
+    forward[server.forward] --> queue[server.queue]
+    forward --> write[server.write]
+    write -->|trace ID and parent span ID| process[client.process]
+    process --> feedback[client.feedback]
+    process --> resolve[client.resolve]
+    process --> inject[client.inject]
+```
+
+`server.queue` measures time until the writer dequeues the frame. `server.write` covers the socket write. On macOS, `client.process` starts after reading the complete frame. Its children cover enabled feedback, OpenLogi resolution, and injection as applicable. A consumed OpenLogi event ends after resolution. Compare local span durations directly. Interpreting the gap between machines requires synchronized clocks. The trace contains stage names, IDs, and timing. HID values and clipboard contents stay out of span attributes.
+
+With tracing disabled, the client advertises input protocol v2 and sends the same handshake as previous releases. A client configured with a trace endpoint advertises v3, so upgrade the server before enabling it. The server accepts both versions. It wraps only sampled frames on a v3 connection when its own endpoint is configured. Each envelope adds 25 bytes. Both reporters export asynchronously through fastrace, independently of `latencyStats`.
 
 ### Latency diagnostics
 

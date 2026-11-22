@@ -226,6 +226,21 @@ let
         combined.launchd.agents.openlogi-agent.config.ProgramArguments == [
           "${combined.services.hidpipe.openlogi.package}/bin/openlogi-agent"
         ];
+    trace =
+      let
+        settings.trace = {
+          endpoint = "http://collector:4318/v1/traces";
+          sampleEvery = 7;
+        };
+        server = linuxExec (evaluate "x86_64-linux" settings);
+      in
+      arguments (darwin settings) == base
+      ++ [
+        "--trace-endpoint"
+        settings.trace.endpoint
+      ]
+      && lib.hasInfix ''"--trace-endpoint" "${settings.trace.endpoint}" "--trace-every" "7"'' server
+      && !(lib.hasInfix "--trace-" (linuxExec linuxDefaults));
     linux =
       linuxExec linuxDefaults == linuxExec linuxChanged
       && lib.hasInfix "--bind" (linuxExec linuxChanged)

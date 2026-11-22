@@ -11,34 +11,10 @@ let
 in
 {
   options = {
-    enable = lib.mkEnableOption "hidpipe Linux input capture";
-
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.callPackage ../package.nix { };
-      defaultText = lib.literalExpression "hidpipe.packages.\${pkgs.stdenv.hostPlatform.system}.hidpipe-server";
-      description = "Package providing hidpipe-server.";
-    };
-
     bind = lib.mkOption {
       type = lib.types.str;
       default = "0.0.0.0";
       description = "Address on which to listen for the macOS client.";
-    };
-
-    port = lib.mkOption {
-      type = lib.types.port;
-      default = 24800;
-      description = "TCP port on which to listen.";
-    };
-
-    clipboard = {
-      enable = lib.mkEnableOption "bidirectional text and image clipboard sharing over the trusted LAN";
-      port = lib.mkOption {
-        type = lib.types.port;
-        default = 24801;
-        description = "Separate TCP port for clipboard sharing; must differ from the input port.";
-      };
     };
 
     keyboard = lib.mkOption {
@@ -55,16 +31,16 @@ in
       description = "Mouse device name substring, or null for automatic detection.";
     };
 
-    latencyStats = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Log local latency counts, means and maxima every 5 seconds.";
-    };
-
     swapCapsEsc = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = "Swap Caps Lock and Escape on capture, when keyd does not already do so.";
+    };
+
+    trace.sampleEvery = lib.mkOption {
+      type = lib.types.ints.between 1 4294967295;
+      default = 100;
+      description = "Trace the first input frame and every Nth input thereafter on each trace-capable connection.";
     };
 
     systemdTarget = lib.mkOption {
@@ -113,6 +89,12 @@ in
           "--clipboard"
           "--clipboard-port"
           (toString cfg.clipboard.port)
+        ]
+        ++ lib.optionals (cfg.trace.endpoint != null) [
+          "--trace-endpoint"
+          cfg.trace.endpoint
+          "--trace-every"
+          (toString cfg.trace.sampleEvery)
         ]
         ++ lib.optional cfg.latencyStats "--latency-stats"
         ++ lib.optional cfg.swapCapsEsc "--swap-caps-esc"

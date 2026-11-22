@@ -1,5 +1,5 @@
 //! Explicit, loopback-only input source for the real macOS client.
-use hidpipe_proto::{read_frame, write_frame, Frame, VERSION};
+use hidpipe_proto::{read_frame, write_frame, Frame, TRACE_VERSION, VERSION};
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{
@@ -20,7 +20,7 @@ Usage: cargo run -p hidpipe-proto --example scroll_fixture -- [options]
   --start-delay-ms <0..10000> default 0; use 2000 to focus the target app after Enter
   --timeout-seconds <1..3600> accept/READY/sequence deadlines (default 120 each)
   --help                 print help without binding a socket
-One client, native Wheel only, no device capture. Requires Hello VERSION/openlogi=false.
+One client, native Wheel only, no device capture. Requires a supported Hello with openlogi=false.
 Start listener after READY; press Enter only after it prints LISTENING.
 Ping every 250 ms; socket I/O timeout 3 s; replies are drained in a background thread.
 ";
@@ -172,15 +172,14 @@ fn run(opt: Options) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    if read_frame(&mut stream)?
-        != (Frame::Hello {
-            version: VERSION,
-            openlogi: false,
-        })
-    {
-        return Err(invalid(
-            "expected Hello { version: VERSION, openlogi: false }",
-        ));
+    if !matches!(
+        read_frame(&mut stream)?,
+        Frame::Hello {
+            version: VERSION | TRACE_VERSION,
+            openlogi: false
+        }
+    ) {
+        return Err(invalid("expected a supported Hello with openlogi=false"));
     }
 
     let mut reader = stream.try_clone()?;

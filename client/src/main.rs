@@ -85,8 +85,11 @@ fn timestamp() -> String {
         .unwrap_or_default()
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     let args = Args::parse();
+    if let Some(endpoint) = &args.trace_endpoint {
+        proto::trace::init("hidpipe-client", endpoint)?;
+    }
     if args.clipboard {
         proto::clipboard::spawn_client(
             args.host.clone(),
@@ -169,7 +172,11 @@ fn session(
     proto::write_frame(
         &mut stream,
         &Frame::Hello {
-            version: proto::VERSION,
+            version: if args.trace_endpoint.is_some() {
+                proto::TRACE_VERSION
+            } else {
+                proto::VERSION
+            },
             openlogi: resolver.is_some(),
         },
     )?;
@@ -201,8 +208,11 @@ fn session(
     transport::run(
         &mut stream,
         resolver.as_mut(),
-        args.input_feedback,
-        args.latency_stats,
+        transport::Options {
+            input_feedback: args.input_feedback,
+            latency_stats: args.latency_stats,
+            trace_enabled: args.trace_endpoint.is_some(),
+        },
         |frame| {
             let kind = match frame {
                 Frame::Motion { .. } | Frame::Pointer(PointerEvent::Motion { .. }) => "motion",
@@ -603,6 +613,7 @@ struct Args {
     clipboard: bool,
     clipboard_port: u16,
     input_feedback: bool,
+    trace_endpoint: Option<String>,
     latency_stats: bool,
     openlogi_socket: Option<std::path::PathBuf>,
     scroll: ScrollModifier,
@@ -623,6 +634,7 @@ Options:
   --allow-idle-sleep  let macOS idle-sleep while connected (by default the
                       client holds a power assertion so the Mac stays
                       reachable; the display still sleeps)
+  --trace-endpoint <url>  export sampled inputs to an OTLP/HTTP trace URL
   --latency-stats   log local timing summaries every 5 seconds
   --invert-scroll-x   flip horizontal scroll direction
   --invert-scroll-y   flip vertical scroll direction
@@ -642,6 +654,7 @@ impl Args {
             clipboard: false,
             clipboard_port: 24801,
             input_feedback: false,
+            trace_endpoint: None,
             latency_stats: false,
             openlogi_socket: None,
             scroll: ScrollModifier {
@@ -688,6 +701,12 @@ impl Args {
                 }
                 "--input-feedback" => args.input_feedback = true,
                 "--allow-idle-sleep" => args.allow_idle_sleep = true,
+                "--trace-endpoint" => {
+                    args.trace_endpoint = Some(it.next().unwrap_or_else(|| {
+                        eprintln!("--trace-endpoint requires a URL\n{USAGE}");
+                        std::process::exit(2);
+                    }));
+                }
                 "--latency-stats" => args.latency_stats = true,
                 "--invert-scroll-x" => args.scroll.invert_x = true,
                 "--invert-scroll-y" => args.scroll.invert_y = true,

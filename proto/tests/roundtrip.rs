@@ -73,6 +73,31 @@ fn encode_decode_roundtrip() {
 }
 
 #[test]
+fn traced_stream_rejects_partial_context_and_control_frames() {
+    use fastrace::collector::{SpanContext, SpanId, TraceId};
+    use hidpipe_proto::{read_frame, read_trace_frame, write_trace_frame};
+
+    let context = SpanContext::new(TraceId(u128::MAX), SpanId(u64::MAX));
+    let mut bytes = Vec::new();
+    write_trace_frame(&mut bytes, &Frame::ReleaseAll, context).unwrap();
+    assert_eq!(
+        read_trace_frame(&mut &bytes[..]).unwrap(),
+        (Frame::ReleaseAll, Some(context))
+    );
+    assert!(read_frame(&mut &bytes[..]).is_err()); // v2 input reader
+    for end in 0..bytes.len() {
+        assert!(read_trace_frame(&mut &bytes[..end]).is_err());
+    }
+    for tag in [encode(&Frame::Ping)[0], bytes[0]] {
+        let mut malformed = bytes.clone();
+        *malformed.last_mut().unwrap() = tag;
+        assert!(read_trace_frame(&mut &malformed[..]).is_err());
+    }
+    bytes[1..17].fill(0);
+    assert!(read_trace_frame(&mut &bytes[..]).is_err());
+}
+
+#[test]
 fn rejects_garbage() {
     assert_eq!(payload_len(0xff), None);
     assert_eq!(decode(0x01, &[0x00]), None); // wrong length

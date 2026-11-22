@@ -62,6 +62,9 @@ impl DeviceKind {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    if let Some(endpoint) = &args.trace_endpoint {
+        hidpipe_proto::trace::init("hidpipe-server", endpoint)?;
+    }
     let (barrier_tx, barrier_rx) = mpsc::channel::<BarrierEvent>();
     barrier::spawn(barrier_tx)?;
     let (kbd, kbd_path) = open_device(DeviceKind::Keyboard, args.keyboard.as_deref())?;
@@ -127,6 +130,7 @@ fn main() -> io::Result<()> {
         hires_wheel,
         armed: true,
         swap_caps_esc: args.swap_caps_esc,
+        trace_every: args.trace_endpoint.map(|_| args.trace_every),
         latency_stats: args.latency_stats,
         listener,
         net_tx,
@@ -173,6 +177,7 @@ struct App {
     /// ignored whenever its HI_RES counterpart exists.
     hires_wheel: (bool, bool),
     swap_caps_esc: bool,
+    trace_every: Option<std::num::NonZeroU32>,
     latency_stats: bool,
     listener: TcpListener,
     net_tx: mpsc::Sender<NetMsg>,
@@ -215,7 +220,11 @@ impl App {
     fn handle_net_msgs(&mut self) {
         while let Ok(msg) = self.net_rx.try_recv() {
             match msg {
-                NetMsg::Hello(id, openlogi) => {
+                NetMsg::Hello {
+                    id,
+                    openlogi,
+                    supports_trace,
+                } => {
                     if self.pending.as_ref().is_some_and(|(c, _)| c.id == id) {
                         if openlogi != self.openlogi_socket.is_some() {
                             log!("pointer backend mismatch; both peers must enable OpenLogi together");
@@ -223,7 +232,10 @@ impl App {
                             continue;
                         }
                         self.leave_remote();
-                        let (conn, addr) = self.pending.take().expect("checked above");
+                        let (mut conn, addr) = self.pending.take().expect("checked above");
+                        if supports_trace {
+                            conn.trace_every = self.trace_every;
+                        }
                         log!("client ready: {addr}");
                         // A handshaken connection is allowed to take over;
                         // this is the reconnect path after a client restart.
@@ -516,8 +528,8 @@ impl App {
         }
     }
 
-    fn send(&self, frame: Frame) {
-        if let Some(conn) = &self.conn {
+    fn send(&mut self, frame: Frame) {
+        if let Some(conn) = &mut self.conn {
             conn.send(frame);
         }
     }

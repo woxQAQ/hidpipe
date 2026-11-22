@@ -13,6 +13,8 @@ pub struct Args {
     /// remote side never sees it, so this flag redoes it. Do not enable it
     /// if keyd or udev already does the swap.
     pub swap_caps_esc: bool,
+    pub trace_endpoint: Option<String>,
+    pub trace_every: std::num::NonZeroU32,
     pub latency_stats: bool,
     pub clipboard: bool,
     pub clipboard_port: u16,
@@ -32,6 +34,8 @@ Options:
   --swap-caps-esc      swap caps and esc for keys sent to the remote
   --clipboard         share text and images over a separate trusted-LAN connection
   --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
+  --trace-endpoint <url>  export sampled inputs to an OTLP/HTTP trace URL
+  --trace-every <n>    sample one input in n (default 100)
   --latency-stats      log local timing summaries every 5 seconds
   -h, --help           show this help
 
@@ -48,6 +52,8 @@ impl Args {
             mouse: None,
             openlogi_socket: None,
             swap_caps_esc: false,
+            trace_endpoint: None,
+            trace_every: std::num::NonZeroU32::new(100).unwrap(),
             latency_stats: false,
             clipboard: false,
             clipboard_port: 24801,
@@ -77,6 +83,13 @@ impl Args {
                 "--clipboard-port" => {
                     args.clipboard_port = take("--clipboard-port").parse().unwrap_or_else(|_| {
                         eprintln!("--clipboard-port is not a valid port number\n{USAGE}");
+                        std::process::exit(2);
+                    });
+                }
+                "--trace-endpoint" => args.trace_endpoint = Some(take("--trace-endpoint")),
+                "--trace-every" => {
+                    args.trace_every = take("--trace-every").parse().unwrap_or_else(|_| {
+                        eprintln!("--trace-every requires a positive 32-bit integer\n{USAGE}");
                         std::process::exit(2);
                     });
                 }

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fastrace.workspace = true
 evdev = "0.12"
 # Edge barrier: layer-shell client.
 wayland-client = "0.31"
@@ -16,3 +17,8 @@ time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 # fcntl takes AsFd, while evdev 0.12's Device only implements AsRawFd.
 nix = "0.23"
 hidpipe-proto = { path = "../proto" }
+
+[dev-dependencies]
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "0.14"
+tiny_http = "0.12"

@@ -32,16 +32,10 @@ let
   };
 in
 {
+  imports = [ ./common.nix ];
+
   options.services.hidpipe = server.options // {
     openlogi = openlogi.options;
-    enable = lib.mkEnableOption "hidpipe";
-
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.callPackage ../package.nix { };
-      defaultText = lib.literalExpression "hidpipe.packages.\${pkgs.stdenv.hostPlatform.system}.default";
-      description = "Package providing the server on Linux or the client on macOS.";
-    };
 
     localSigning.enable =
       lib.mkEnableOption "persistent local signing and stable macOS application bundles"
@@ -61,12 +55,6 @@ in
       default = null;
       example = "192.168.1.10";
       description = "Host name or IP address of the Linux capture server. Required on macOS.";
-    };
-
-    port = lib.mkOption {
-      type = lib.types.port;
-      default = 24800;
-      description = "TCP port used by the server and client.";
     };
 
     scroll = {
@@ -214,6 +202,10 @@ in
               "--clipboard"
               "--clipboard-port"
               (toString cfg.clipboard.port)
+            ]
+            ++ lib.optionals (cfg.trace.endpoint != null) [
+              "--trace-endpoint"
+              cfg.trace.endpoint
             ]
             ++ lib.optional cfg.inputFeedback "--input-feedback"
             ++ lib.optional (!cfg.stayAwake) "--allow-idle-sleep"
