@@ -7,10 +7,13 @@ license.workspace = true
 [dependencies]
 core-foundation = "0.10"
 fastrace.workspace = true
+opentelemetry = { workspace = true, features = ["logs"] }
+opentelemetry_sdk = { workspace = true, features = ["logs"] }
+opentelemetry-otlp = { workspace = true, features = ["logs"] }
 core-graphics = { version = "0.25", features = ["highsierra"] }
 # Releases held keys on SIGTERM/SIGINT so no keys get stuck at the system
 # level.
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 # Log timestamps only, pure formatting.
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 hidpipe-proto = { path = "../proto" }

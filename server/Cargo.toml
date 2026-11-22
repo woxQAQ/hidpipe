@@ -19,6 +19,9 @@ nix = "0.23"
 hidpipe-proto = { path = "../proto" }
 
 [dev-dependencies]
-opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace"] }
+opentelemetry = { workspace = true, features = ["logs"] }
+opentelemetry_sdk = { workspace = true, features = ["logs"] }
+opentelemetry-otlp = { workspace = true, features = ["logs"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
 prost = "0.14"
 tiny_http = "0.12"

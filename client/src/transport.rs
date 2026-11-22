@@ -25,7 +25,7 @@ pub fn run(
     stream: &mut TcpStream,
     mut resolver: Option<&mut Resolver>,
     options: Options,
-    mut inject: impl FnMut(Frame) -> Option<Frame>,
+    mut inject: impl FnMut(Frame, Option<Span>) -> Option<Frame>,
     allowed: impl Fn() -> bool,
 ) -> io::Result<()> {
     let mut stats = options.latency_stats.then(|| LatencyStats::new(STAGES));
@@ -47,7 +47,7 @@ pub fn run(
         // the packet intended to carry the TCP ACK. Ping keeps its own reply;
         // replying to Pong would create a feedback loop.
         if options.input_feedback && frame.is_input() {
-            timing.stage(2, || proto::write_frame(stream, &Frame::Pong))?;
+            timing.stage(2, |_| proto::write_frame(stream, &Frame::Pong))?;
         }
         match frame {
             Frame::Ping => {
@@ -63,23 +63,23 @@ pub fn run(
                 let resolver = resolver
                     .as_mut()
                     .ok_or_else(|| io::Error::other("server requires an OpenLogi bridge"))?;
-                if timing.stage(0, || resolver.resolve(event))? {
-                    if let Some(back) = timing.stage(1, || inject(frame)) {
+                if timing.stage(0, |_| resolver.resolve(event))? {
+                    if let Some(back) = timing.stage(1, |span| inject(frame, span)) {
                         proto::write_frame(stream, &back)?;
                     }
                 }
             }
             Frame::ReleaseAll => {
-                timing.stage(1, || inject(frame));
+                timing.stage(1, |span| inject(frame, span));
                 if let Some(resolver) = resolver.as_mut() {
-                    timing.stage(0, || resolver.resolve(PointerEvent::Reset))?;
+                    timing.stage(0, |_| resolver.resolve(PointerEvent::Reset))?;
                 }
             }
             frame @ (Frame::Key { .. }
             | Frame::Motion { .. }
             | Frame::Button { .. }
             | Frame::Wheel { .. }) => {
-                if let Some(back) = timing.stage(1, || inject(frame)) {
+                if let Some(back) = timing.stage(1, |span| inject(frame, span)) {
                     proto::write_frame(stream, &back)?;
                 }
             }
@@ -98,13 +98,13 @@ struct FrameTiming<'a> {
 }
 
 impl FrameTiming<'_> {
-    fn stage<T>(&mut self, stage: usize, action: impl FnOnce() -> T) -> T {
-        let _span = self
+    fn stage<T>(&mut self, stage: usize, action: impl FnOnce(Option<Span>) -> T) -> T {
+        let span = self
             .span
             .as_ref()
             .map(|parent| Span::enter_with_parent(STAGES[stage], parent));
         let started = self.stats.as_ref().map(|_| Instant::now());
-        let result = action();
+        let result = action(span);
         if let (Some(stats), Some(started)) = (self.stats.as_mut(), started) {
             stats.record(stage, started.elapsed());
         }

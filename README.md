@@ -373,9 +373,20 @@ flowchart LR
     process --> inject[client.inject]
 ```
 
-`server.queue` measures time until the writer dequeues the frame. `server.write` covers the socket write. On macOS, `client.process` starts after reading the complete frame. Its children cover enabled feedback, OpenLogi resolution, and injection as applicable. A consumed OpenLogi event ends after resolution. Compare local span durations directly. Interpreting the gap between machines requires synchronized clocks. The trace contains stage names, IDs, and timing. HID values and clipboard contents stay out of span attributes.
+`server.queue` measures time until the writer dequeues the frame. `server.write` covers the socket write. On macOS, `client.process` starts after reading the complete frame. Its children cover enabled feedback, OpenLogi resolution, and injection as applicable. A consumed OpenLogi event ends after resolution. Compare local span durations directly. Interpreting the gap between machines requires synchronized clocks. Each sampled `client.inject` span includes `input.kind` (motion, key, button, wheel, or control), `input_seq` (the injection number starting at 1 for each connection), `session_age_ms`, and the measured Quartz creation and posting times `create_us` and `post_us`. A stage that did not run has a duration of zero. HID values and clipboard contents stay out of span attributes.
 
 With tracing disabled, the client advertises input protocol v2 and sends the same handshake as previous releases. A client configured with a trace endpoint advertises v3, so upgrade the server before enabling it. The server accepts both versions. It wraps only sampled frames on a v3 connection when its own endpoint is configured. Each envelope adds 25 bytes. Both reporters export asynchronously through fastrace, independently of `latencyStats`.
+
+### Slow injection logs on macOS
+
+Set `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` to a full OTLP/HTTP protobuf logs URL to record every injection taking at least 2 ms, including inputs skipped by trace sampling. For Home Manager:
+
+```nix
+launchd.agents.hidpipe.config.EnvironmentVariables.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT =
+  "http://collector.lan:4318/v1/logs";
+```
+
+In VictoriaLogs, query `"service.name":="hidpipe-client" AND _msg:="slow-inject"`. Each event includes numeric session, sequence, and timing fields. Compare `create_us` with `post_us` to distinguish Quartz creation from submission. Sampled slow events also carry the trace ID and the `client.inject` span ID. The client writes a local `[slow-inject]` line before returning to its input loop. Remote delivery uses the OpenTelemetry SDK's bounded background batch queue and can lose records during an outage. Log export works independently of `--latency-stats` and trace export.
 
 ### Latency diagnostics
 

@@ -1,5 +1,8 @@
 //! Exercise connection admission, input ordering and feedback on real TCP sockets.
 
+#[allow(dead_code)]
+#[path = "../../client/src/diagnostics.rs"]
+mod diagnostics;
 #[path = "../src/net.rs"]
 mod net;
 #[path = "../../client/src/transport.rs"]
@@ -11,6 +14,10 @@ use std::time::Duration;
 
 use hidpipe_proto::{self as proto, Frame, KeyState};
 use net::{Connection, NetMsg, Rejection};
+
+fn timestamp() -> String {
+    "network-test".into()
+}
 
 #[test]
 fn feedback_preserves_input_order_and_does_not_echo() {
@@ -91,6 +98,7 @@ fn feedback_preserves_input_order_and_does_not_echo() {
 /// Exercise both process-local reporters and the parent IDs received by an OTLP sink.
 #[test]
 fn sampled_inputs_cross_processes() {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use prost::Message;
@@ -105,7 +113,10 @@ fn sampled_inputs_cross_processes() {
         Frame::Motion { dx: 2, dy: 0 },
     ];
     if let Ok(addr) = std::env::var(CHILD_ADDR) {
-        proto::trace::init("hidpipe-client", &std::env::var(ENDPOINT).unwrap()).unwrap();
+        let url = std::env::var(ENDPOINT).unwrap();
+        proto::trace::init("hidpipe-client", &url).unwrap();
+        let provider = diagnostics::log_provider(&url.replace("/v1/traces", "/v1/logs")).unwrap();
+        let mut session = diagnostics::Session::new(false, Some(&provider));
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.set_read_timeout(Some(timeout)).unwrap();
         proto::write_frame(
@@ -125,9 +136,17 @@ fn sampled_inputs_cross_processes() {
                 latency_stats: false,
                 trace_enabled: true,
             },
-            |frame| {
-                injected.push(frame);
-                (injected.len() == frames.len()).then_some(Frame::ReturnToLocal)
+            |frame, span| {
+                session.inject(frame, span, || {
+                    // Delay one sampled and one ordinary input inside the creation stage.
+                    if injected.len() < 2 {
+                        diagnostics::measure(diagnostics::Stage::Create, || {
+                            thread::sleep(Duration::from_millis(4))
+                        });
+                    }
+                    injected.push(frame);
+                    (injected.len() == frames.len()).then_some(Frame::ReturnToLocal)
+                })
             },
             || true,
         );
@@ -137,6 +156,7 @@ fn sampled_inputs_cross_processes() {
         );
         assert_eq!(injected, frames);
         fastrace::flush();
+        provider.shutdown().unwrap();
         return;
     }
 
@@ -146,10 +166,23 @@ fn sampled_inputs_cross_processes() {
         let collector = Arc::clone(&collector);
         move || {
             let mut spans = Vec::new();
+            let mut logs = Vec::new();
             while let Ok(mut request) = collector.recv() {
-                assert_eq!(request.url(), "/v1/traces");
                 let mut bytes = Vec::new();
                 request.as_reader().read_to_end(&mut bytes).unwrap();
+                if request.url() == "/v1/logs" {
+                    for resource in ExportLogsServiceRequest::decode(&*bytes)
+                        .unwrap()
+                        .resource_logs
+                    {
+                        for scope in resource.scope_logs {
+                            logs.extend(scope.log_records);
+                        }
+                    }
+                    request.respond(tiny_http::Response::empty(200)).unwrap();
+                    continue;
+                }
+                assert_eq!(request.url(), "/v1/traces");
                 let export = ExportTraceServiceRequest::decode(&*bytes).unwrap();
                 for resource in export.resource_spans {
                     let service = resource
@@ -172,7 +205,7 @@ fn sampled_inputs_cross_processes() {
                 }
                 request.respond(tiny_http::Response::empty(200)).unwrap();
             }
-            spans
+            (spans, logs)
         }
     });
     proto::trace::init("hidpipe-server", &url).unwrap();
@@ -209,7 +242,57 @@ fn sampled_inputs_cross_processes() {
     assert!(client.wait().unwrap().success());
     fastrace::flush();
     collector.unblock();
-    let records = sink.join().unwrap();
+    let (records, logs) = sink.join().unwrap();
+    let field = |attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue], key: &str| {
+        attrs
+            .iter()
+            .find(|a| a.key == key)
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap()
+            .value
+            .clone()
+            .unwrap()
+    };
+    for (seq, kind) in [(1, "motion"), (2, "control")] {
+        let log = logs
+            .iter()
+            .find(|log| field(&log.attributes, "input_seq") == Value::IntValue(seq))
+            .unwrap();
+        assert_eq!(log.event_name, "slow-inject");
+        assert_eq!(
+            field(&log.attributes, "input.kind"),
+            Value::StringValue(kind.into())
+        );
+        assert!(matches!(field(&log.attributes, "create_us"), Value::IntValue(us) if us >= 2000));
+        if seq == 1 {
+            let (_, injection) = records
+                .iter()
+                .find(|(_, s)| s.name == "client.inject" && s.span_id == log.span_id)
+                .unwrap();
+            assert_eq!(log.trace_id, injection.trace_id);
+            assert_eq!(
+                field(&injection.attributes, "input.kind"),
+                Value::StringValue("motion".into())
+            );
+            assert_eq!(
+                field(&injection.attributes, "input_seq"),
+                Value::StringValue("1".into())
+            );
+            assert!(
+                matches!(field(&injection.attributes, "create_us"), Value::StringValue(v) if v.parse::<u64>().unwrap() >= 2000)
+            );
+            for key in ["post_us", "session_age_ms"] {
+                assert!(matches!(
+                    field(&injection.attributes, key),
+                    Value::StringValue(_)
+                ));
+            }
+        } else {
+            assert!(log.trace_id.is_empty() && log.span_id.is_empty());
+        }
+    }
     let roots: Vec<_> = records
         .iter()
         .filter(|(_, s)| s.name == "server.forward")

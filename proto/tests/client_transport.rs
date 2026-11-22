@@ -48,7 +48,7 @@ fn feedback_precedes_injection_and_can_be_disabled() {
                     latency_stats: true,
                     trace_enabled: false,
                 },
-                |received| {
+                |received, _| {
                     entered.send(received).unwrap();
                     resumed.recv_timeout(Duration::from_secs(2)).unwrap();
                     Some(Frame::ReturnToLocal)
@@ -121,7 +121,7 @@ fn feedback_does_not_bypass_binding_disposition_or_reset() {
                 latency_stats: true,
                 trace_enabled: false,
             },
-            |frame| {
+            |frame, _| {
                 injected.send(frame).unwrap();
                 None
             },

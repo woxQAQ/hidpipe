@@ -453,6 +453,9 @@ dependencies = [
  "ctrlc",
  "fastrace",
  "hidpipe-proto",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "time",
 ]
 
@@ -475,7 +478,10 @@ dependencies = [
  "fastrace",
  "hidpipe-proto",
  "nix 0.23.2",
+ "opentelemetry",
+ "opentelemetry-otlp",
  "opentelemetry-proto",
+ "opentelemetry_sdk",
  "prost",
  "time",
  "tiny_http",

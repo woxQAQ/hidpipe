@@ -90,6 +90,10 @@ fn main() -> io::Result<()> {
     if let Some(endpoint) = &args.trace_endpoint {
         proto::trace::init("hidpipe-client", endpoint)?;
     }
+    let log_provider = std::env::var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+        .ok()
+        .map(|endpoint| diagnostics::log_provider(&endpoint))
+        .transpose()?;
     if args.clipboard {
         proto::clipboard::spawn_client(
             args.host.clone(),
@@ -114,10 +118,14 @@ fn main() -> io::Result<()> {
     let pressed = Arc::new(Mutex::new(PressedState::default()));
     {
         let pressed = Arc::clone(&pressed);
+        let log_provider = log_provider.clone();
         ctrlc::set_handler(move || {
             let mut state = pressed.lock().unwrap();
             if let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
                 release_all(&source, &mut state);
+            }
+            if let Some(provider) = &log_provider {
+                let _ = provider.shutdown();
             }
             std::process::exit(0);
         })
@@ -143,7 +151,7 @@ fn main() -> io::Result<()> {
             log!("macOS input injection access granted");
             requested_access = false;
         }
-        match session(&args, Arc::clone(&pressed), display) {
+        match session(&args, Arc::clone(&pressed), display, log_provider.as_ref()) {
             Ok(()) => log!("peer closed the connection"),
             Err(e) => log!("connection interrupted: {e}"),
         }
@@ -159,6 +167,7 @@ fn session(
     args: &Args,
     pressed: Arc<Mutex<PressedState>>,
     display: &'static DisplayCache,
+    log_provider: Option<&opentelemetry_sdk::logs::SdkLoggerProvider>,
 ) -> io::Result<()> {
     let mut resolver = args
         .openlogi_socket
@@ -180,6 +189,7 @@ fn session(
             openlogi: resolver.is_some(),
         },
     )?;
+    let mut diagnostics = diagnostics::Session::new(args.latency_stats, log_provider);
     log!("connected to {}:{}", args.host, args.port);
     // Held exactly for the connection's lifetime: sleep would freeze this
     // process, the server would drop the connection, and the Mac would
@@ -213,17 +223,7 @@ fn session(
             latency_stats: args.latency_stats,
             trace_enabled: args.trace_endpoint.is_some(),
         },
-        |frame| {
-            let kind = match frame {
-                Frame::Motion { .. } | Frame::Pointer(PointerEvent::Motion { .. }) => "motion",
-                Frame::Key { .. } => "key",
-                Frame::Button { .. } | Frame::Pointer(PointerEvent::Button { .. }) => "button",
-                Frame::Wheel { .. } | Frame::Pointer(PointerEvent::Wheel { .. }) => "wheel",
-                _ => "control",
-            };
-            let _injection = diagnostics::Injection::begin(args.latency_stats, kind);
-            injector.handle(frame)
-        },
+        |frame, span| diagnostics.inject(frame, span, || injector.handle(frame)),
         event_access::is_allowed,
     )
 }
