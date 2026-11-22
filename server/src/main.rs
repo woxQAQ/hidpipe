@@ -103,7 +103,7 @@ fn main() -> io::Result<()> {
     listener.set_nonblocking(true)?;
     log!("listening on {}:{}", args.bind, args.port);
     if args.clipboard {
-        clipboard::spawn_server(&args.bind, args.clipboard_port)?;
+        clipboard::spawn_server(&args.bind, args.clipboard_port, clipboard_log)?;
         log!(
             "clipboard listening on {}:{}",
             args.bind,
@@ -521,6 +521,10 @@ impl App {
             conn.send(frame);
         }
     }
+}
+
+fn clipboard_log(message: &str) {
+    log!("{message}");
 }
 
 /// Match a device by name substring; without a filter, auto-detect by

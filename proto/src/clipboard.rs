@@ -53,6 +53,9 @@ const HEARTBEAT: Duration = Duration::from_secs(2);
 const DEAD_TIMEOUT: Duration = Duration::from_secs(8);
 const PING: u32 = u32::MAX;
 
+/// Clipboard lines carry their tag; the embedding binary adds timestamps.
+pub type Log = fn(&str);
+
 /// A missing supported representation differs from an explicitly empty string.
 pub trait Clipboard {
     fn read(&mut self) -> io::Result<Option<Content>>;
@@ -182,24 +185,29 @@ fn execute(command: &mut Command, input: Option<&[u8]>) -> io::Result<(bool, Vec
 }
 
 #[cfg(target_os = "linux")]
-pub fn spawn_server(bind: &str, port: u16) -> io::Result<()> {
+pub fn spawn_server(bind: &str, port: u16, log: Log) -> io::Result<()> {
     let listener = TcpListener::bind((bind, port))?;
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    if let Err(error) = session(stream, &mut SystemClipboard) {
-                        eprintln!("[clipboard] connection ended: {error}");
+                    if let Err(error) = session(stream, &mut SystemClipboard, log) {
+                        log(&format!("[clipboard] connection ended: {error}"));
                     }
                 }
-                Err(error) => eprintln!("[clipboard] accept failed: {error}"),
+                Err(error) => log(&format!("[clipboard] accept failed: {error}")),
             }
         }
     });
     Ok(())
 }
 
-pub fn spawn_client(host: String, port: u16, mut clipboard: impl Clipboard + Send + 'static) {
+pub fn spawn_client(
+    host: String,
+    port: u16,
+    mut clipboard: impl Clipboard + Send + 'static,
+    log: Log,
+) {
     thread::spawn(move || loop {
         let result = (host.as_str(), port)
             .to_socket_addrs()
@@ -207,14 +215,14 @@ pub fn spawn_client(host: String, port: u16, mut clipboard: impl Clipboard + Sen
                 let mut last = io::Error::other("clipboard host has no addresses");
                 for address in addresses {
                     match TcpStream::connect_timeout(&address, IO_TIMEOUT) {
-                        Ok(stream) => return session(stream, &mut clipboard),
+                        Ok(stream) => return session(stream, &mut clipboard, log),
                         Err(error) => last = error,
                     }
                 }
                 Err(last)
             });
         if let Err(error) = result {
-            eprintln!("[clipboard] connection ended: {error}");
+            log(&format!("[clipboard] connection ended: {error}"));
         }
         thread::sleep(Duration::from_secs(2));
     });
@@ -222,7 +230,7 @@ pub fn spawn_client(host: String, port: u16, mut clipboard: impl Clipboard + Sen
 
 /// Run a bidirectional session. Partial reads retain their bytes across timeouts.
 /// Records contain a type byte followed by bounded UTF-8 text or PNG bytes.
-pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Result<()> {
+pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard, log: Log) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -236,7 +244,7 @@ pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Res
         ));
     }
     stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-    eprintln!("[clipboard] connected");
+    log("[clipboard] connected");
     let outgoing = Outgoing::new(&stream)?;
     let initial = clipboard.read();
     let mut initialized = initial.is_ok();
@@ -318,7 +326,7 @@ pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Res
                         initialized = true;
                         backend_failed = false;
                     }
-                    Err(error) => report_backend_error(&mut backend_failed, error),
+                    Err(error) => report_backend_error(log, &mut backend_failed, error),
                 }
             }
             incoming.drain(..end);
@@ -351,7 +359,7 @@ pub fn session(mut stream: TcpStream, clipboard: &mut impl Clipboard) -> io::Res
                         }
                     }
                 }
-                Err(error) => report_backend_error(&mut backend_failed, error),
+                Err(error) => report_backend_error(log, &mut backend_failed, error),
             }
             next_poll = Instant::now() + POLL;
         }
@@ -417,9 +425,9 @@ impl Drop for Outgoing {
     }
 }
 
-fn report_backend_error(failed: &mut bool, error: io::Error) {
+fn report_backend_error(log: Log, failed: &mut bool, error: io::Error) {
     if !*failed {
-        eprintln!("[clipboard] local clipboard unavailable: {error}");
+        log(&format!("[clipboard] local clipboard unavailable: {error}"));
     }
     *failed = true;
 }

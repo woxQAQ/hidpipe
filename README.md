@@ -86,6 +86,8 @@ hidpipe-client <linux-ip>         # retries once a second until connected
 
 On first run, grant **Accessibility** access to the executable in `System Settings > Privacy & Security > Accessibility`. A `launchd` service needs its own permission; the terminal's permission does not cover it. Until event-posting access is granted, the client waits without connecting to Linux.
 
+While connected, the client holds a macOS power assertion against idle system sleep: the keyboard and mouse belong to the Linux machine, so without it macOS sees no local activity, sleeps, and the connection dies until an unrelated wake. The display still sleeps on its own, and injected input wakes it; lid close and low-battery sleep are unaffected. Pass `--allow-idle-sleep` to opt out.
+
 ### CLI options
 
 | `hidpipe-server` | Default | Description |
@@ -109,6 +111,7 @@ On first run, grant **Accessibility** access to the executable in `System Settin
 | `--clipboard` | off | Enable bidirectional text and image clipboard sharing with the Linux server |
 | `--clipboard-port <port>` | `24801` | Server clipboard port (requires `--clipboard`; must match the server) |
 | `--input-feedback` | off | Reply with a `Pong` to every input frame to mitigate TCP delayed ACK |
+| `--allow-idle-sleep` | off | Let macOS idle-sleep while connected; by default the client holds a power assertion so the Mac stays reachable (the display still sleeps) |
 | `--scroll-scale-x <f>` | `1.0` | Multiply horizontal Wheel input by a finite, non-negative value; `0` disables this axis |
 | `--scroll-scale-y <f>` | `1.0` | Multiply vertical Wheel input by a finite, non-negative value; `0` disables this axis |
 | `--invert-scroll-x` | off | Reverse horizontal Wheel input |
@@ -248,6 +251,7 @@ Subsequent rebuilds and rollbacks reuse the same bundle IDs and certificate, pre
 | `host` | required on macOS | macOS (HM) | Host name or IP address of the Linux server |
 | `localSigning.enable` | `true` on macOS | macOS (HM) | Install and locally sign stable app bundles in `~/Applications` |
 | `inputFeedback` | `false` | macOS (HM) | Reply with a `Pong` to each input frame to mitigate TCP delayed ACK |
+| `stayAwake` | `true` | macOS (HM) | Prevent idle system sleep while connected to the server, so the Mac stays reachable at the screen edge; the display still sleeps |
 | `scroll.scaleX` | `1.0` | macOS (HM) | Finite, non-negative horizontal Wheel multiplier (integer or float); `0` disables this axis |
 | `scroll.scaleY` | `1.0` | macOS (HM) | Finite, non-negative vertical Wheel multiplier (integer or float); `0` disables this axis |
 | `scroll.invertX` | `false` | macOS (HM) | Reverse horizontal Wheel input; excludes HID++ thumbwheel actions |

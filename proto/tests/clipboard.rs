@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use hidpipe_proto::clipboard::{self, Clipboard, Content, MAX_IMAGE_BYTES, MAX_TEXT_BYTES};
 
+fn quiet(_: &str) {}
+
 struct MemoryClipboard {
     content: Arc<Mutex<Option<Content>>>,
     writes: mpsc::Sender<Content>,
@@ -64,7 +66,7 @@ impl Harness {
             writes: write_tx,
             reads: read_tx,
         };
-        let worker = thread::spawn(move || clipboard::session(server, &mut clipboard));
+        let worker = thread::spawn(move || clipboard::session(server, &mut clipboard, quiet));
         let mut magic = [0; 8];
         peer.read_exact(&mut magic).unwrap();
         assert_eq!(&magic, b"HIDCLIP\x02");
@@ -274,7 +276,7 @@ fn rejects_old_protocol_before_accessing_clipboard() {
         writes,
         reads,
     };
-    let worker = thread::spawn(move || clipboard::session(server, &mut clipboard));
+    let worker = thread::spawn(move || clipboard::session(server, &mut clipboard, quiet));
     peer.write_all(b"HIDCLIP\x01").unwrap();
     assert_eq!(
         worker.join().unwrap().unwrap_err().kind(),

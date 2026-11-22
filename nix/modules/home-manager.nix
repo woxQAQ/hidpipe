@@ -114,6 +114,16 @@ in
         Enable for comparison with the default behavior; adds a Pong per input frame.
       '';
     };
+
+    stayAwake = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Hold a macOS power assertion while connected to the server, so the Mac
+        never idle-sleeps and stays reachable at the screen edge. The display
+        still sleeps; lid close and low-battery sleep are unaffected. macOS only.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable (
@@ -206,6 +216,7 @@ in
               (toString cfg.clipboard.port)
             ]
             ++ lib.optional cfg.inputFeedback "--input-feedback"
+            ++ lib.optional (!cfg.stayAwake) "--allow-idle-sleep"
             ++ lib.optional cfg.latencyStats "--latency-stats"
             ++ lib.optionals (cfg.scroll.scaleX != 1.0) [
               "--scroll-scale-x"

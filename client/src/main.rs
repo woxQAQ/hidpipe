@@ -32,6 +32,8 @@ mod diagnostics;
 mod display_cache;
 #[allow(unsafe_code)]
 mod event_access;
+#[allow(unsafe_code)]
+mod power;
 mod scroll;
 mod table;
 mod transport;
@@ -90,6 +92,7 @@ fn main() {
             args.host.clone(),
             args.clipboard_port,
             clipboard::MacClipboard,
+            clipboard_log,
         );
     }
     let display = DisplayCache::main_display().unwrap_or_else(|error| {
@@ -145,6 +148,10 @@ fn main() {
     }
 }
 
+fn clipboard_log(message: &str) {
+    log!("{message}");
+}
+
 fn session(
     args: &Args,
     pressed: Arc<Mutex<PressedState>>,
@@ -167,6 +174,23 @@ fn session(
         },
     )?;
     log!("connected to {}:{}", args.host, args.port);
+    // Held exactly for the connection's lifetime: sleep would freeze this
+    // process, the server would drop the connection, and the Mac would
+    // stay unreachable until an unrelated wake. Every exit path of this
+    // function drops the guard and releases the assertion.
+    let _assertion = if args.allow_idle_sleep {
+        None
+    } else {
+        match power::Assertion::prevent_idle_system_sleep("hidpipe remote input session") {
+            Ok(assertion) => Some(assertion),
+            Err(error) => {
+                log!(
+                    "cannot prevent idle sleep ({error}); the Mac may become unreachable when idle"
+                );
+                None
+            }
+        }
+    };
 
     log!(
         "input feedback: {}; latency stats: {}",
@@ -582,6 +606,7 @@ struct Args {
     latency_stats: bool,
     openlogi_socket: Option<std::path::PathBuf>,
     scroll: ScrollModifier,
+    allow_idle_sleep: bool,
 }
 
 const USAGE: &str = "\
@@ -595,6 +620,9 @@ Options:
   --clipboard    share text and images over a separate trusted-LAN connection
   --clipboard-port <port>  clipboard port (default 24801; requires --clipboard)
   --input-feedback  reply to every input frame to mitigate TCP delayed ACK
+  --allow-idle-sleep  let macOS idle-sleep while connected (by default the
+                      client holds a power assertion so the Mac stays
+                      reachable; the display still sleeps)
   --latency-stats   log local timing summaries every 5 seconds
   --invert-scroll-x   flip horizontal scroll direction
   --invert-scroll-y   flip vertical scroll direction
@@ -622,6 +650,7 @@ impl Args {
                 invert_x: false,
                 invert_y: false,
             },
+            allow_idle_sleep: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -658,6 +687,7 @@ impl Args {
                     });
                 }
                 "--input-feedback" => args.input_feedback = true,
+                "--allow-idle-sleep" => args.allow_idle_sleep = true,
                 "--latency-stats" => args.latency_stats = true,
                 "--invert-scroll-x" => args.scroll.invert_x = true,
                 "--invert-scroll-y" => args.scroll.invert_y = true,
